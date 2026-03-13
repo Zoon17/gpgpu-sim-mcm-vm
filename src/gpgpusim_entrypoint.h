@@ -1,3 +1,8 @@
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
 // Copyright (c) 2009-2011, Tor M. Aamodt
 // The University of British Columbia
 // All rights reserved.
@@ -33,6 +38,7 @@
 #include <semaphore.h>
 #include <time.h>
 #include "abstract_hardware_model.h"
+#include "gpgpu-sim/memory_owner.h"
 
 // extern time_t g_simulation_starttime;
 class gpgpu_context;
@@ -51,6 +57,8 @@ class GPGPUsim_ctx {
     the_cude_device = NULL;
     the_context = NULL;
     gpgpu_ctx = ctx;
+
+    g_mmu = nullptr;
   }
 
   // struct gpgpu_ptx_sim_arg *grid_params;
@@ -73,6 +81,8 @@ class GPGPUsim_ctx {
   bool g_sim_active;
   bool g_sim_done;
   bool break_limit;
+
+  mmu * g_mmu;
 };
 
 #endif

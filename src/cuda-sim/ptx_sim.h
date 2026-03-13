@@ -43,6 +43,8 @@
 
 #include "memory.h"
 
+#define APP_ID 1
+
 #define GCC_VERSION \
   (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__)
 
@@ -302,6 +304,7 @@ class ptx_thread_info {
     m_hw_wid = wid;
     m_hw_tid = tid;
     m_functionalSimulationMode = fsim;
+    m_appID = APP_ID;
   }
 
   void ptx_fetch_inst(inst_t &inst) const;
@@ -336,6 +339,9 @@ class ptx_thread_info {
   void print_insn(unsigned pc, FILE *fp) const;
   void set_info(function_info *func);
   unsigned get_uid() const { return m_uid; }
+
+  int m_appID;
+  unsigned get_appID() const { return this->m_appID; }
 
   dim3 get_ctaid() const { return m_ctaid; }
   dim3 get_tid() const { return m_tid; }

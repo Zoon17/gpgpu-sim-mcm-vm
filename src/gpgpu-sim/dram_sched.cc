@@ -33,13 +33,16 @@
 #include "mem_latency_stat.h"
 
 frfcfs_scheduler::frfcfs_scheduler(const memory_config *config, dram_t *dm,
-                                   memory_stats_t *stats) {
+                                   memory_stats_t *stats, tlb_tag_array * shared_tlb) {
   m_config = config;
+  m_shared_tlb = shared_tlb;
   m_stats = stats;
   m_num_pending = 0;
   m_num_write_pending = 0;
   m_dram = dm;
+
   m_queue = new std::list<dram_req_t *>[m_config->nbk];
+
   m_bins = new std::map<
       unsigned, std::list<std::list<dram_req_t *>::iterator> >[m_config->nbk];
   m_last_row =
@@ -69,8 +72,9 @@ frfcfs_scheduler::frfcfs_scheduler(const memory_config *config, dram_t *dm,
   m_mode = READ_MODE;
 }
 
+// pw dram priority update - frfcfs_scheduler
 void frfcfs_scheduler::add_req(dram_req_t *req) {
-  if (m_config->seperate_write_queue_enabled && req->data->is_write()) {
+  if (m_config->seperate_write_queue_enabled && req->data->is_write()) {  // now, seperate write queue is not used
     assert(m_num_write_pending < m_config->gpgpu_frfcfs_dram_write_queue_size);
     m_num_write_pending++;
     m_write_queue[req->bk].push_front(req);
@@ -109,13 +113,14 @@ void frfcfs_scheduler::data_collection(unsigned int bank) {
 dram_req_t *frfcfs_scheduler::schedule(unsigned bank, unsigned curr_row) {
   // row
   bool rowhit = true;
+
   std::list<dram_req_t *> *m_current_queue = m_queue;
   std::map<unsigned, std::list<std::list<dram_req_t *>::iterator> >
       *m_current_bins = m_bins;
   std::list<std::list<dram_req_t *>::iterator> **m_current_last_row =
       m_last_row;
 
-  if (m_config->seperate_write_queue_enabled) {
+  if (m_config->seperate_write_queue_enabled) {  // not used in default
     if (m_mode == READ_MODE &&
         ((m_num_write_pending >= m_config->write_high_watermark)
          // || (m_queue[bank].empty() && !m_write_queue[bank].empty())
@@ -135,13 +140,13 @@ dram_req_t *frfcfs_scheduler::schedule(unsigned bank, unsigned curr_row) {
     m_current_last_row = m_last_write_row;
   }
 
-  if (m_current_last_row[bank] == NULL) {
-    if (m_current_queue[bank].empty()) return NULL;
+  if (m_current_last_row[bank] == NULL) {  // check current row status
+    if (m_current_queue[bank].empty()) return NULL;  // if there is no request, return null
 
     std::map<unsigned, std::list<std::list<dram_req_t *>::iterator> >::iterator
         bin_ptr = m_current_bins[bank].find(curr_row);
     if (bin_ptr == m_current_bins[bank].end()) {
-      dram_req_t *req = m_current_queue[bank].back();
+      dram_req_t *req = m_current_queue[bank].back();  // control current row
       bin_ptr = m_current_bins[bank].find(req->row);
       assert(bin_ptr !=
              m_current_bins[bank].end());  // where did the request go???
@@ -209,10 +214,6 @@ void dram_t::scheduler_frfcfs() {
   frfcfs_scheduler *sched = m_frfcfs_scheduler;
   while (!mrqq->empty()) {
     dram_req_t *req = mrqq->pop();
-
-    // Power stats
-    // if(req->data->get_type() != READ_REPLY && req->data->get_type() !=
-    // WRITE_ACK)
     m_stats->total_n_access++;
 
     if (req->data->get_type() == WRITE_REQUEST) {

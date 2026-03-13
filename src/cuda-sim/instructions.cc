@@ -1,19 +1,21 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Wilson W.L. Fung, Ali Bakhoda,
-// Jimmy Kwa, George L. Yuan
-// The University of British Columbia
+// Copyright (c) 2009-2021, Tor M. Aamodt, Wilson W.L. Fung, Ali Bakhoda,
+// Jimmy Kwa, George L. Yuan, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -26,6 +28,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+
 #include "instructions.h"
 #include "half.h"
 #include "half.hpp"
@@ -57,6 +60,8 @@ class ptx_recognizer;
 
 #include <stdarg.h>
 #include "../../libcuda/gpgpu_context.h"
+
+#define APP_ID 1
 
 using half_float::half;
 
@@ -166,8 +171,9 @@ void inst_not_implemented(const ptx_instruction *pI);
 ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
                               operand_info dstInfo, unsigned type,
                               ptx_thread_info *thread);
-                              
-void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread, int op_code);
+
+void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread,
+                           int op_code);
 
 void sign_extend(ptx_reg_t &data, unsigned src_size, const operand_info &dst);
 
@@ -398,8 +404,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // global memory - g[4], g[$r0]
     mem = thread->get_global_memory();
     type_info_key::type_decode(opType, size, t);
-    mem->read(result.u32, size / 8, &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read(result.u64, size / 8, &finalResult.u128, APP_ID);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = global_space;
 
     if (opType == S16_TYPE || opType == S32_TYPE)
@@ -408,8 +414,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // shared memory - s[4], s[$r0]
     mem = thread->m_shared_mem;
     type_info_key::type_decode(opType, size, t);
-    mem->read(result.u32, size / 8, &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read(result.u64, size / 8, &finalResult.u128, APP_ID);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = shared_space;
 
     if (opType == S16_TYPE || opType == S32_TYPE)
@@ -418,9 +424,9 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // const memory - ce0c1[4], ce0c1[$r0]
     mem = thread->get_global_memory();
     type_info_key::type_decode(opType, size, t);
-    mem->read((result.u32 + op.get_const_mem_offset()), size / 8,
-              &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read((result.u64 + op.get_const_mem_offset()), size / 8,
+              &finalResult.u128, APP_ID);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = const_space;
     if (opType == S16_TYPE || opType == S32_TYPE)
       sign_extend(finalResult, size, dstInfo);
@@ -428,8 +434,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // local memory - l0[4], l0[$r0]
     mem = thread->m_local_mem;
     type_info_key::type_decode(opType, size, t);
-    mem->read(result.u32, size / 8, &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read(result.u64, size / 8, &finalResult.u128, APP_ID);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = local_space;
     if (opType == S16_TYPE || opType == S32_TYPE)
       sign_extend(finalResult, size, dstInfo);
@@ -748,8 +754,8 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
     mem = thread->get_global_memory();
     type_info_key::type_decode(type, size, t);
 
-    mem->write(dstData.u32, size / 8, &data.u128, thread, pI);
-    thread->m_last_effective_address = dstData.u32;
+    mem->write(dstData.u64, size / 8, &data.u128, thread, pI, APP_ID);
+    thread->m_last_effective_address = dstData.u64;
     thread->m_last_memory_space = global_space;
   }
 
@@ -759,8 +765,8 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
     mem = thread->m_shared_mem;
     type_info_key::type_decode(type, size, t);
 
-    mem->write(dstData.u32, size / 8, &data.u128, thread, pI);
-    thread->m_last_effective_address = dstData.u32;
+    mem->write(dstData.u64, size / 8, &data.u128, thread, pI, APP_ID);
+    thread->m_last_effective_address = dstData.u64;
     thread->m_last_memory_space = shared_space;
   }
 
@@ -770,8 +776,8 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
     mem = thread->m_local_mem;
     type_info_key::type_decode(type, size, t);
 
-    mem->write(dstData.u32, size / 8, &data.u128, thread, pI);
-    thread->m_last_effective_address = dstData.u32;
+    mem->write(dstData.u64, size / 8, &data.u128, thread, pI, APP_ID);
+    thread->m_last_effective_address = dstData.u64;
     thread->m_last_memory_space = local_space;
   }
 
@@ -1199,7 +1205,7 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
 
   // Copy value pointed to in operand 'a' into register 'd'
   // (i.e. copy src1_data to dst)
-  mem->read(effective_address, size / 8, &data.s64);
+  mem->read(effective_address, size / 8, &data.s64, APP_ID);
   if (dst.get_symbol()->type()) {
     thread->set_operand_value(dst, data, to_type, thread,
                               pI);  // Write value into register 'd'
@@ -1453,7 +1459,7 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
   // Write operation result into  memory
   // (i.e. copy src1_data to dst)
   if (data_ready) {
-    mem->write(effective_address, size / 8, &op_result.s64, thread, pI);
+    mem->write(effective_address, size / 8, &op_result.s64, thread, pI, APP_ID);
   } else {
     printf("Execution error: data_ready not set\n");
     assert(0);
@@ -1711,40 +1717,50 @@ void bfi_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
-void bfind_impl(const ptx_instruction *pI, ptx_thread_info *thread)
-{
-  const operand_info &dst  = pI->dst();
+void bfind_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
   const unsigned i_type = pI->get_type();
 
-  const ptx_reg_t src1_data = thread->get_operand_value(src1, dst, i_type, thread, 1);
-  const int msb = ( i_type == U32_TYPE || i_type == S32_TYPE) ? 31 : 63;
+  const ptx_reg_t src1_data =
+      thread->get_operand_value(src1, dst, i_type, thread, 1);
+  const int msb = (i_type == U32_TYPE || i_type == S32_TYPE) ? 31 : 63;
 
   unsigned long a = 0;
-  switch (i_type)
-  {
-    case S32_TYPE: a = src1_data.s32; break;
-    case U32_TYPE: a = src1_data.u32; break;
-    case S64_TYPE: a = src1_data.s64; break;
-    case U64_TYPE: a = src1_data.u64; break;
-    default: assert(false); abort();
+  switch (i_type) {
+    case S32_TYPE:
+      a = src1_data.s32;
+      break;
+    case U32_TYPE:
+      a = src1_data.u32;
+      break;
+    case S64_TYPE:
+      a = src1_data.s64;
+      break;
+    case U64_TYPE:
+      a = src1_data.u64;
+      break;
+    default:
+      assert(false);
+      abort();
   }
 
   // negate negative signed inputs
-  if ( ( i_type == S32_TYPE || i_type == S64_TYPE ) && ( a & ( 1 << msb ) ) ) {
-      a = ~a;
+  if ((i_type == S32_TYPE || i_type == S64_TYPE) && (a & (1 << msb))) {
+    a = ~a;
   }
   uint32_t d_data = 0xffffffff;
   for (uint32_t i = msb; i >= 0; i--) {
-      if (a & (1<<i))  { d_data = i; break; }
+    if (a & (1 << i)) {
+      d_data = i;
+      break;
+    }
   }
 
   // if (.shiftamt && d != 0xffffffff)  { d = msb - d; }
 
   // store d
   thread->set_operand_value(dst, d_data, U32_TYPE, thread, pI);
-
-
 }
 
 void bra_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -1934,7 +1950,7 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
             hex_val = (v[k / 2].s64 & 0xffff);
           else
             hex_val = ((v[k / 2].s64 & 0xffff0000) >> 16);
-          nw_v[k].f16 = *((half *)&hex_val);
+          nw_v[k].f16 = *(reinterpret_cast<half*>(hex_val));
         }
       }
       if (!((operand_num == 3) && (type2 == F32_TYPE))) {
@@ -3367,7 +3383,7 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned vector_spec = pI->get_vector();
 
   memory_space *mem = NULL;
-  addr_t addr = src1_data.u32;
+  addr_t addr = src1_data.u64;
 
   decode_space(space, thread, src1, mem, addr);
 
@@ -3376,17 +3392,17 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   data.u64 = 0;
   type_info_key::type_decode(type, size, t);
   if (!vector_spec) {
-    mem->read(addr, size / 8, &data.s64);
+    mem->read(addr, size / 8, &data.s64, APP_ID);
     if (type == S16_TYPE || type == S32_TYPE) sign_extend(data, size, dst);
     thread->set_operand_value(dst, data, type, thread, pI);
   } else {
     ptx_reg_t data1, data2, data3, data4;
-    mem->read(addr, size / 8, &data1.s64);
-    mem->read(addr + size / 8, size / 8, &data2.s64);
+    mem->read(addr, size / 8, &data1.s64, APP_ID);
+    mem->read(addr + size / 8, size / 8, &data2.s64, APP_ID);
     if (vector_spec != V2_TYPE) {  // either V3 or V4
-      mem->read(addr + 2 * size / 8, size / 8, &data3.s64);
+      mem->read(addr + 2 * size / 8, size / 8, &data3.s64, APP_ID);
       if (vector_spec != V3_TYPE) {  // v4
-        mem->read(addr + 3 * size / 8, size / 8, &data4.s64);
+        mem->read(addr + 3 * size / 8, size / 8, &data4.s64,APP_ID);
         thread->set_vector_operand_values(dst, data1, data2, data3, data4);
       } else  // v3
         thread->set_vector_operand_values(dst, data1, data2, data3, data3);
@@ -3440,7 +3456,7 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     memory_space_t space = pI->get_space();
 
     memory_space *mem = NULL;
-    addr_t addr = addr_reg.u32;
+    addr_t addr = addr_reg.u64;
 
     new_addr_type mem_txn_addr[MAX_ACCESSES_PER_INSN_PER_THREAD];
     int num_mem_txn = 0;
@@ -3454,8 +3470,8 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 
     type_info_key::type_decode(type, size, t);
     if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
-      printf("mma_st: thrd=%d, addr=%x, fp(size=%zu), stride=%d\n", thrd,
-             addr_reg.u32, size, src2_data.u32);
+      printf("mma_st: thrd=%d, addr=%llx, fp(size=%zu), stride=%d\n", thrd,
+             addr_reg.u64, size, src2_data.u32);
     addr_t new_addr =
         addr + thread_group_offset(thrd, wmma_type, wmma_layout, type, stride) *
                    size / 8;
@@ -3473,7 +3489,7 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
       if (type == F32_TYPE) {
         // mem->write(new_addr+4*acc_float_offset(k,wmma_layout,stride),size/8,&v[k].s64,thread,pI);
         push_addr = new_addr + 4 * acc_float_offset(k, wmma_layout, stride);
-        mem->write(push_addr, size / 8, &v[k].s64, thread, pI);
+        mem->write(push_addr, size / 8, &v[k].s64, thread, pI, APP_ID);
         mem_txn_addr[num_mem_txn++] = push_addr;
 
         if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
@@ -3494,12 +3510,12 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
         if (wmma_layout == ROW) {
           // mem->write(new_addr+k*2,size/8,&nw_v[k].s64,thread,pI);
           push_addr = new_addr + k * 2;
-          mem->write(push_addr, size / 8, &nw_v[k].s64, thread, pI);
+          mem->write(push_addr, size / 8, &nw_v[k].s64, thread, pI, APP_ID);
           if (k % 2 == 0) mem_txn_addr[num_mem_txn++] = push_addr;
         } else if (wmma_layout == COL) {
           // mem->write(new_addr+k*2*stride,size/8,&nw_v[k].s64,thread,pI);
           push_addr = new_addr + k * 2 * stride;
-          mem->write(push_addr, size / 8, &nw_v[k].s64, thread, pI);
+          mem->write(push_addr, size / 8, &nw_v[k].s64, thread, pI, APP_ID);
           mem_txn_addr[num_mem_txn++] = push_addr;
         }
 
@@ -3560,7 +3576,7 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     memory_space_t space = pI->get_space();
 
     memory_space *mem = NULL;
-    addr_t addr = src1_data.u32;
+    addr_t addr = src1_data.u64;
     smid = thread->get_hw_sid();
     if (whichspace(addr) == shared_space) {
       addr = generic_to_shared(smid, addr);
@@ -3572,8 +3588,8 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 
     ptx_reg_t data[16];
     if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
-      printf("mma_ld: thrd=%d,addr=%x, fpsize=%zu, stride=%d\n", thrd,
-             src1_data.u32, size, src2_data.u32);
+      printf("mma_ld: thrd=%d,addr=%llx, fpsize=%zu, stride=%d\n", thrd,
+             src1_data.u64, size, src2_data.u32);
 
     addr_t new_addr =
         addr + thread_group_offset(thrd, wmma_type, wmma_layout, type, stride) *
@@ -3587,11 +3603,11 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
         if (wmma_layout == ROW) {
           // mem->read(new_addr+2*i,size/8,&data[i].s64);
           fetch_addr = new_addr + 2 * i;
-          mem->read(fetch_addr, size / 8, &data[i].s64);
+          mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
         } else if (wmma_layout == COL) {
           // mem->read(new_addr+2*(i%4)+2*stride*4*(i/4),size/8,&data[i].s64);
           fetch_addr = new_addr + 2 * (i % 4) + 2 * stride * 4 * (i / 4);
-          mem->read(fetch_addr, size / 8, &data[i].s64);
+          mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
         } else {
           printf("mma_ld:wrong_layout_type\n");
           abort();
@@ -3603,11 +3619,11 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
         if (wmma_layout == COL) {
           // mem->read(new_addr+2*i,size/8,&data[i].s64);
           fetch_addr = new_addr + 2 * i;
-          mem->read(fetch_addr, size / 8, &data[i].s64);
+          mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
         } else if (wmma_layout == ROW) {
           // mem->read(new_addr+2*(i%4)+2*stride*4*(i/4),size/8,&data[i].s64);
           fetch_addr = new_addr + 2 * (i % 4) + 2 * stride * 4 * (i / 4);
-          mem->read(fetch_addr, size / 8, &data[i].s64);
+          mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
         } else {
           printf("mma_ld:wrong_layout_type\n");
           abort();
@@ -3620,12 +3636,12 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
           if (wmma_layout == ROW) {
             // mem->read(new_addr+2*i,size/8,&data[i].s64);
             fetch_addr = new_addr + 2 * i;
-            mem->read(fetch_addr, size / 8, &data[i].s64);
+            mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
             if (i % 2 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
           } else if (wmma_layout == COL) {
             // mem->read(new_addr+2*stride*i,size/8,&data[i].s64);
             fetch_addr = new_addr + 2 * stride * i;
-            mem->read(fetch_addr, size / 8, &data[i].s64);
+            mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
             mem_txn_addr[num_mem_txn++] = fetch_addr;
           } else {
             printf("mma_ld:wrong_type\n");
@@ -3634,7 +3650,7 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
         } else if (type == F32_TYPE) {
           // mem->read(new_addr+4*acc_float_offset(i,wmma_layout,stride),size/8,&data[i].s64);
           fetch_addr = new_addr + 4 * acc_float_offset(i, wmma_layout, stride);
-          mem->read(fetch_addr, size / 8, &data[i].s64);
+          mem->read(fetch_addr, size / 8, &data[i].s64, APP_ID);
           mem_txn_addr[num_mem_txn++] = fetch_addr;
         } else {
           printf("wrong type");
@@ -3966,7 +3982,7 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
           fesetround(FE_TOWARDZERO);
           break;
         default:
-          assert(0);
+          //assert(0);
           break;
       }
       d.f32 = a.f32 * b.f32 + c.f32;
@@ -4312,11 +4328,8 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     case S64_TYPE:
       t.s64 = a.s64 * b.s64;
       assert(!pI->is_wide());
-      assert(!pI->is_hi());
-      if (pI->is_lo())
-        d.s64 = t.s64;
-      else
-        assert(0);
+      //assert(!pI->is_hi());
+      d.s64 = t.s64;
       break;
     case U16_TYPE:
       t.u32 = ((unsigned)a.u16) * ((unsigned)b.u16);
@@ -5429,6 +5442,34 @@ void shfl_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
   }
 }
 
+void shf_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  ptx_reg_t a,b,c,d;
+  const operand_info &dst = pI->dst();
+  const operand_info &src1 = pI->src1();
+  const operand_info &src2 = pI->src2();
+  const operand_info &src3 = pI->src3();
+  // Only b32 is allowed
+  unsigned i_type = pI->get_type();
+  a = thread->get_operand_value(src1, dst, i_type, thread, 1);
+  b = thread->get_operand_value(src2, dst, i_type, thread, 1);
+  c = thread->get_operand_value(src3, dst, i_type, thread, 1);
+  if(i_type != B32_TYPE)
+    printf("Only the b32 data_type is allowed per the ISA\n");
+  unsigned clamp_mode = pI->clamp_mode();
+  unsigned n = c.u32 & 0x1f;
+  if(clamp_mode) {
+    if(c.u32 < 32)
+      n = c;
+    else
+      n = 32;
+  }
+  if(pI->left_mode())
+    d.u32 = (b.u32 << n) | (a.u32 >> (32-n));
+  else
+    d.u32 = (b.u32 << (32-n)) | (a.u32 >> n);
+  thread->set_operand_value(dst, d, i_type, thread, pI);
+}
+
 void shl_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t a, b, d;
   const operand_info &dst = pI->dst();
@@ -5667,7 +5708,7 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   memory_space_t space = pI->get_space();
   memory_space *mem = NULL;
   addr_t addr =
-      src2_data.u32 * 4;  // this assumes sstarr memory starts at address 0
+      src2_data.u64 * 4;  // this assumes sstarr memory starts at address 0
   ptx_cta_info *cta_info = thread->m_cta_info;
 
   decode_space(space, thread, src1, mem, addr);
@@ -5677,7 +5718,7 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   type_info_key::type_decode(type, size, t);
 
   // store data in sstarr memory
-  mem->write(addr, size / 8, &src3_data.s64, thread, pI);
+  mem->write(addr, size / 8, &src3_data.s64, thread, pI, APP_ID);
 
   // sync threads
   cpI->set_bar_id(16);  // use 16 for sst because bar uses an int from 0-15
@@ -5699,7 +5740,7 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     // loop through all of the threads
     for (int tid = 0; tid < NUM_THREADS; tid++) {
       data.u64 = 0;
-      mem->read(addr + (tid * 4), size / 8, &data.s64);
+      mem->read(addr + (tid * 4), size / 8, &data.s64, APP_ID);
       sstarr_fdata[tid] = data.f32;
       sstarr_ldata[tid] = data.s64;
     }
@@ -5707,7 +5748,7 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     // squeeze the zeros out of the array and store data back into original
     // array
     mem = NULL;
-    addr = src1_data.u32;
+    addr = src1_data.u64;
     space.set_type(global_space);
     decode_space(space, thread, src1, mem, addr);
     // store nonzero entries and indices
@@ -5715,9 +5756,9 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       if (sstarr_fdata[tid] != 0) {
         float ftid = (float)tid;
         mem->write(addr + (offset * 4), size / 8, &sstarr_ldata[tid], thread,
-                   pI);
+                   pI, APP_ID);
         mem->write(addr + ((NUM_THREADS + offset) * 4), size / 8, &ftid, thread,
-                   pI);
+                   pI, APP_ID);
         offset++;
       }
     }
@@ -5728,7 +5769,7 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
     // fill the rest of the array with zeros (dst should always have a 0 in it)
     while (offset < NUM_THREADS) {
-      mem->write(addr + (offset * 4), size / 8, &dst_data.s64, thread, pI);
+      mem->write(addr + (offset * 4), size / 8, &dst_data.s64, thread, pI, APP_ID);
       offset++;
     }
 
@@ -5754,7 +5795,7 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned vector_spec = pI->get_vector();
 
   memory_space *mem = NULL;
-  addr_t addr = addr_reg.u32;
+  addr_t addr = addr_reg.u64;
 
   decode_space(space, thread, dst, mem, addr);
 
@@ -5764,30 +5805,30 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   if (!vector_spec) {
     data = thread->get_operand_value(src1, dst, type, thread, 1);
-    mem->write(addr, size / 8, &data.s64, thread, pI);
+    mem->write(addr, size / 8, &data.s64, thread, pI, APP_ID);
   } else {
     if (vector_spec == V2_TYPE) {
       ptx_reg_t *ptx_regs = new ptx_reg_t[2];
       thread->get_vector_operand_values(src1, ptx_regs, 2);
-      mem->write(addr, size / 8, &ptx_regs[0].s64, thread, pI);
-      mem->write(addr + size / 8, size / 8, &ptx_regs[1].s64, thread, pI);
+      mem->write(addr, size / 8, &ptx_regs[0].s64, thread, pI, APP_ID);
+      mem->write(addr + size / 8, size / 8, &ptx_regs[1].s64, thread, pI, APP_ID);
       delete[] ptx_regs;
     }
     if (vector_spec == V3_TYPE) {
       ptx_reg_t *ptx_regs = new ptx_reg_t[3];
       thread->get_vector_operand_values(src1, ptx_regs, 3);
-      mem->write(addr, size / 8, &ptx_regs[0].s64, thread, pI);
-      mem->write(addr + size / 8, size / 8, &ptx_regs[1].s64, thread, pI);
-      mem->write(addr + 2 * size / 8, size / 8, &ptx_regs[2].s64, thread, pI);
+      mem->write(addr, size / 8, &ptx_regs[0].s64, thread, pI, APP_ID);
+      mem->write(addr + size / 8, size / 8, &ptx_regs[1].s64, thread, pI, APP_ID);
+      mem->write(addr + 2 * size / 8, size / 8, &ptx_regs[2].s64, thread, pI, APP_ID);
       delete[] ptx_regs;
     }
     if (vector_spec == V4_TYPE) {
       ptx_reg_t *ptx_regs = new ptx_reg_t[4];
       thread->get_vector_operand_values(src1, ptx_regs, 4);
-      mem->write(addr, size / 8, &ptx_regs[0].s64, thread, pI);
-      mem->write(addr + size / 8, size / 8, &ptx_regs[1].s64, thread, pI);
-      mem->write(addr + 2 * size / 8, size / 8, &ptx_regs[2].s64, thread, pI);
-      mem->write(addr + 3 * size / 8, size / 8, &ptx_regs[3].s64, thread, pI);
+      mem->write(addr, size / 8, &ptx_regs[0].s64, thread, pI, APP_ID);
+      mem->write(addr + size / 8, size / 8, &ptx_regs[1].s64, thread, pI, APP_ID);
+      mem->write(addr + 2 * size / 8, size / 8, &ptx_regs[2].s64, thread, pI, APP_ID);
+      mem->write(addr + 3 * size / 8, size / 8, &ptx_regs[3].s64, thread, pI,APP_ID);
       delete[] ptx_regs;
     }
   }
@@ -5941,14 +5982,14 @@ float tex_linf_sampling(memory_space *mem, unsigned tex_array_base, int x,
   float Tij1;
   float Ti1j1;
 
-  mem->read(tex_array_base + b_lim(x, y, width, height, elem_size), 4, &Tij);
+  mem->read(tex_array_base + b_lim(x, y, width, height, elem_size), 4, &Tij, APP_ID);
   mem->read(tex_array_base + b_lim(x + elem_size, y, width, height, elem_size),
-            4, &Ti1j);
+            4, &Ti1j, APP_ID);
   mem->read(tex_array_base + b_lim(x, y + 1, width, height, elem_size), 4,
-            &Tij1);
+            &Tij1, APP_ID);
   mem->read(
       tex_array_base + b_lim(x + elem_size, y + 1, width, height, elem_size), 4,
-      &Ti1j1);
+      &Ti1j1, APP_ID);
 
   float sample = (1 - alpha) * (1 - beta) * Tij + alpha * (1 - beta) * Ti1j +
                  (1 - alpha) * beta * Tij1 + alpha * beta * Ti1j1;
@@ -6194,19 +6235,19 @@ void tex_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     case S16_TYPE:
     case S32_TYPE: {
       unsigned long long elementOffset = 0;  // offset into the next element
-      mem->read(tex_array_index, cuArray->desc.x / 8, &data1.u32);
+      mem->read(tex_array_index, cuArray->desc.x / 8, &data1.u32, APP_ID);
       elementOffset += cuArray->desc.x / 8;
       if (cuArray->desc.y) {
         mem->read(tex_array_index + elementOffset, cuArray->desc.y / 8,
-                  &data2.u32);
+                  &data2.u32, APP_ID);
         elementOffset += cuArray->desc.y / 8;
         if (cuArray->desc.z) {
           mem->read(tex_array_index + elementOffset, cuArray->desc.z / 8,
-                    &data3.u32);
+                    &data3.u32, APP_ID);
           elementOffset += cuArray->desc.z / 8;
           if (cuArray->desc.w)
             mem->read(tex_array_index + elementOffset, cuArray->desc.w / 8,
-                      &data4.u32);
+                      &data4.u32, APP_ID);
         }
       }
       break;
@@ -6214,12 +6255,12 @@ void tex_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     case B64_TYPE:
     case U64_TYPE:
     case S64_TYPE:
-      mem->read(tex_array_index, 8, &data1.u64);
+      mem->read(tex_array_index, 8, &data1.u64, APP_ID);
       if (cuArray->desc.y) {
-        mem->read(tex_array_index + 8, 8, &data2.u64);
+        mem->read(tex_array_index + 8, 8, &data2.u64, APP_ID);
         if (cuArray->desc.z) {
-          mem->read(tex_array_index + 16, 8, &data3.u64);
-          if (cuArray->desc.w) mem->read(tex_array_index + 24, 8, &data4.u64);
+          mem->read(tex_array_index + 16, 8, &data3.u64, APP_ID);
+          if (cuArray->desc.w) mem->read(tex_array_index + 24, 8, &data4.u64,APP_ID);
         }
       }
       break;
@@ -6258,25 +6299,25 @@ void tex_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
           }
         }
       } else {
-        mem->read(tex_array_index, cuArray->desc.x / 8, &data1.f32);
+        mem->read(tex_array_index, cuArray->desc.x / 8, &data1.f32, APP_ID);
         if (cuArray->desc.y) {
-          mem->read(tex_array_index + 4, cuArray->desc.y / 8, &data2.f32);
+          mem->read(tex_array_index + 4, cuArray->desc.y / 8, &data2.f32, APP_ID);
           if (cuArray->desc.z) {
-            mem->read(tex_array_index + 8, cuArray->desc.z / 8, &data3.f32);
+            mem->read(tex_array_index + 8, cuArray->desc.z / 8, &data3.f32, APP_ID);
             if (cuArray->desc.w)
-              mem->read(tex_array_index + 12, cuArray->desc.w / 8, &data4.f32);
+              mem->read(tex_array_index + 12, cuArray->desc.w / 8, &data4.f32, APP_ID);
           }
         }
       }
     } break;
     case F64_TYPE:
     case FF64_TYPE:
-      mem->read(tex_array_index, 8, &data1.f64);
+      mem->read(tex_array_index, 8, &data1.f64, APP_ID);
       if (cuArray->desc.y) {
-        mem->read(tex_array_index + 8, 8, &data2.f64);
+        mem->read(tex_array_index + 8, 8, &data2.f64, APP_ID);
         if (cuArray->desc.z) {
-          mem->read(tex_array_index + 16, 8, &data3.f64);
-          if (cuArray->desc.w) mem->read(tex_array_index + 24, 8, &data4.f64);
+          mem->read(tex_array_index + 16, 8, &data3.f64, APP_ID);
+          if (cuArray->desc.w) mem->read(tex_array_index + 24, 8, &data4.f64, APP_ID);
         }
       }
       break;
@@ -6339,12 +6380,10 @@ void vmad_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 #define VMAX 0
 #define VMIN 1
 
-void vmax_impl(const ptx_instruction *pI, ptx_thread_info *thread)
-{
-   video_mem_instruction(pI, thread, VMAX);
+void vmax_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  video_mem_instruction(pI, thread, VMAX);
 }
-void vmin_impl(const ptx_instruction *pI, ptx_thread_info *thread)
-{
+void vmin_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   video_mem_instruction(pI, thread, VMIN);
 }
 void vset_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -6440,12 +6479,12 @@ void vote_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
 }
 
-void activemask_impl( const ptx_instruction *pI, ptx_thread_info *thread )
-{
+void activemask_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   active_mask_t l_activemask_bitset = pI->get_warp_active_mask();
-  uint32_t l_activemask_uint = static_cast<uint32_t>(l_activemask_bitset.to_ulong());
+  uint32_t l_activemask_uint =
+      static_cast<uint32_t>(l_activemask_bitset.to_ulong());
 
-  const operand_info &dst  = pI->dst();
+  const operand_info &dst = pI->dst();
   thread->set_operand_value(dst, l_activemask_uint, U32_TYPE, thread, pI);
 }
 
@@ -6490,13 +6529,13 @@ ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
   if (opInfo.get_addr_space() == global_space) {
     mem = thread->get_global_memory();
     type_info_key::type_decode(type, size, t);
-    mem->read(opData.u32, size / 8, &result.u64);
+    mem->read(opData.u64, size / 8, &result.u64, APP_ID);
     if (type == S16_TYPE || type == S32_TYPE)
       sign_extend(result, size, dstInfo);
   } else if (opInfo.get_addr_space() == shared_space) {
     mem = thread->m_shared_mem;
     type_info_key::type_decode(type, size, t);
-    mem->read(opData.u32, size / 8, &result.u64);
+    mem->read(opData.u64, size / 8, &result.u64, APP_ID);
 
     if (type == S16_TYPE || type == S32_TYPE)
       sign_extend(result, size, dstInfo);
@@ -6505,8 +6544,8 @@ ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
     mem = thread->get_global_memory();
     type_info_key::type_decode(type, size, t);
 
-    mem->read((opData.u32 + opInfo.get_const_mem_offset()), size / 8,
-              &result.u64);
+    mem->read((opData.u64 + opInfo.get_const_mem_offset()), size / 8,
+              &result.u64, APP_ID);
 
     if (type == S16_TYPE || type == S32_TYPE)
       sign_extend(result, size, dstInfo);
@@ -6527,12 +6566,12 @@ ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
   return result;
 }
 
-void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread, int op_code)
-{
-  const operand_info &dst  = pI->dst(); // d
-  const operand_info &src1 = pI->src1(); // a
-  const operand_info &src2 = pI->src2(); // b
-  const operand_info &src3 = pI->src3(); // c
+void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread,
+                           int op_code) {
+  const operand_info &dst = pI->dst();    // d
+  const operand_info &src1 = pI->src1();  // a
+  const operand_info &src2 = pI->src2();  // b
+  const operand_info &src3 = pI->src3();  // c
 
   const unsigned i_type = pI->get_type();
 
@@ -6557,19 +6596,18 @@ void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread, i
   auto option = options.begin();
   assert(*option == ATOMIC_MAX || *option == ATOMIC_MIN);
 
-  switch ( i_type ) {
+  switch (i_type) {
     case S32_TYPE: {
       // assert all operands are S32_TYPE:
       scalar_type = pI->get_scalar_type();
-      for (std::list<int>::iterator scalar = scalar_type.begin(); scalar != scalar_type.end(); scalar++)
-      {
+      for (std::list<int>::iterator scalar = scalar_type.begin();
+           scalar != scalar_type.end(); scalar++) {
         assert(*scalar == S32_TYPE);
       }
       assert(scalar_type.size() == 3);
       scalar_type.clear();
 
-      switch (op_code)
-      {
+      switch (op_code) {
         case VMAX:
           data.s32 = MY_MAX_I(ta.s32, tb.s32);
           break;
@@ -6580,26 +6618,23 @@ void video_mem_instruction(const ptx_instruction *pI, ptx_thread_info *thread, i
           assert(0);
       }
 
-      switch (*option)
-      {
+      switch (*option) {
         case ATOMIC_MAX:
           data.s32 = MY_MAX_I(data.s32, c.s32);
-        break;
+          break;
         case ATOMIC_MIN:
           data.s32 = MY_MIN_I(data.s32, c.s32);
-        break;
+          break;
         default:
-          assert(0); // not yet implemented
+          assert(0);  // not yet implemented
       }
       break;
-
     }
     default:
-      assert(0); // not yet implemented
+      assert(0);  // not yet implemented
   }
 
   thread->set_operand_value(dst, data, i_type, thread, pI);
 
   return;
 }
-

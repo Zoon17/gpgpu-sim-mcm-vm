@@ -1,19 +1,21 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Ali Bakhoda, Wilson W.L. Fung,
-// George L. Yuan
-// The University of British Columbia
+// Copyright (c) 2009-2021, Tor M. Aamodt, Ali Bakhoda, Wilson W.L. Fung,
+// George L. Yuan, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -42,6 +44,7 @@ typedef void *yyscan_t;
 #include "../../libcuda/gpgpu_context.h"
 #include "cuda-sim.h"
 
+#define APP_ID 1
 #define STR_SIZE 1024
 
 const ptx_instruction *gpgpu_context::pc_to_instruction(unsigned pc) {
@@ -1093,7 +1096,7 @@ arg_buffer_t copy_arg_to_buffer(ptx_thread_info *thread,
     addr_t from_addr = thread->get_local_mem_stack_pointer() + frame_offset;
     char buffer[1024];
     assert(size < 1024);
-    thread->m_local_mem->read(from_addr, size, buffer);
+    thread->m_local_mem->read(from_addr, size, buffer, APP_ID);
     return arg_buffer_t(formal_param, actual_param_op, buffer, size);
   } else {
     printf(
@@ -1130,7 +1133,7 @@ void copy_buffer_to_frame(ptx_thread_info *thread, const arg_buffer_t &a) {
     const symbol *dst = a.get_dst();
     addr_t frame_offset = dst->get_address();
     addr_t to_addr = thread->get_local_mem_stack_pointer() + frame_offset;
-    thread->m_local_mem->write(to_addr, size, buffer, NULL, NULL);
+    thread->m_local_mem->write(to_addr, size, buffer, NULL, NULL, APP_ID);
   }
 }
 
@@ -1147,8 +1150,8 @@ static std::list<operand_info> check_operands(
     const std::list<operand_info> &operands, gpgpu_context *ctx) {
   static int g_warn_literal_operands_two_type_inst;
   if ((opcode == CVT_OP) || (opcode == SET_OP) || (opcode == SLCT_OP) ||
-      (opcode == TEX_OP) || (opcode == MMA_OP) || (opcode == DP4A_OP) || 
-      (opcode == VMIN_OP) || (opcode == VMAX_OP) ) {
+      (opcode == TEX_OP) || (opcode == MMA_OP) || (opcode == DP4A_OP) ||
+      (opcode == VMIN_OP) || (opcode == VMAX_OP)) {
     // just make sure these do not have have const operands...
     if (!g_warn_literal_operands_two_type_inst) {
       std::list<operand_info>::const_iterator o;
@@ -1197,6 +1200,7 @@ ptx_instruction::ptx_instruction(
     const char *file, unsigned line, const char *source,
     const core_config *config, gpgpu_context *ctx)
     : warp_inst_t(config), m_return_var(ctx) {
+  m_fault   = false;
   gpgpu_ctx = ctx;
   m_uid = ++(ctx->g_num_ptx_inst_uid);
   m_PC = 0;
@@ -1224,6 +1228,8 @@ ptx_instruction::ptx_instruction(
   m_rounding_mode = RN_OPTION;
   m_compare_op = -1;
   m_saturation_mode = 0;
+  m_clamp_mode = 0;
+  m_left_mode = 0;
   m_geom_spec = 0;
   m_vector_spec = 0;
   m_atomic_spec = 0;
@@ -1289,6 +1295,18 @@ ptx_instruction::ptx_instruction(
         break;
       case SAT_OPTION:
         m_saturation_mode = 1;
+        break;
+      case WRAP_OPTION:
+        m_clamp_mode = 0;
+        break;
+      case CLAMP_OPTION:
+        m_clamp_mode = 1;
+        break;
+      case LEFT_OPTION:
+        m_left_mode = 1;
+        break;
+      case RIGHT_OPTION:
+        m_left_mode = 0;
         break;
       case RNI_OPTION:
       case RZI_OPTION:
@@ -1384,6 +1402,8 @@ ptx_instruction::ptx_instruction(
       case CS_OPTION:
       case LU_OPTION:
       case CV_OPTION:
+      case WB_OPTION:
+      case WT_OPTION:
         m_cache_option = last_ptx_inst_option;
         break;
       case HALF_OPTION:
@@ -1466,7 +1486,7 @@ std::string ptx_instruction::to_string() const {
   unsigned used_bytes = 0;
   if (!is_label()) {
     used_bytes +=
-        snprintf(buf + used_bytes, STR_SIZE - used_bytes, " PC=0x%03x ", m_PC);
+        snprintf(buf + used_bytes, STR_SIZE - used_bytes, " PC=0x%03llx ", m_PC);
   } else {
     used_bytes +=
         snprintf(buf + used_bytes, STR_SIZE - used_bytes, "                ");

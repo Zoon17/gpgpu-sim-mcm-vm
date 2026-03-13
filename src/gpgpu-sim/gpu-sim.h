@@ -1,18 +1,25 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Wilson W.L. Fung
-// The University of British Columbia
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
+// Copyright (c) 2009-2021, Tor M. Aamodt, Wilson W.L. Fung, Vijay Kandiah, Nikos Hardavellas
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -25,6 +32,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+
 
 #ifndef GPU_SIM_H
 #define GPU_SIM_H
@@ -39,6 +47,11 @@
 #include "addrdec.h"
 #include "gpu-cache.h"
 #include "shader.h"
+#include <math.h>
+#include <sstream>
+#include <vector>
+#include "memory_owner.h"
+#include <map>
 
 // constants for statistics printouts
 #define GPU_RSTAT_SHD_INFO 0x1
@@ -62,11 +75,51 @@
 #define SAMPLELOG 222
 #define DUMPLOG 333
 
+enum virtual_memory_config {
+    VM_BASELINE     =0,
+    VM_IDEAL_TLB    =1,
+    VM_IDEAL_L2_TLB =2,
+    VM_IDEAL_WALK   =3
+};
+
+// CTA scheduling policy
+enum CTA_SCHEDULE {
+  CTA_BASE_RR     =0,
+  CTA_DISTRIBUTED =1,
+  CTA_KERNEL_WIDE =2,
+  CTA_ALIGNMENT   =3,
+  CTA_ROW_BIND    =4,
+  CTA_COLUMN_BIND =5
+};
+
 class gpgpu_context;
 
 extern tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
 
 enum dram_ctrl_t { DRAM_FIFO = 0, DRAM_FRFCFS = 1 };
+
+enum hw_perf_t {
+  HW_BENCH_NAME=0,
+  HW_KERNEL_NAME,
+  HW_L1_RH,
+  HW_L1_RM,
+  HW_L1_WH,
+  HW_L1_WM,
+  HW_CC_ACC,
+  HW_SHRD_ACC,
+  HW_DRAM_RD,
+  HW_DRAM_WR,
+  HW_L2_RH,
+  HW_L2_RM,
+  HW_L2_WH,
+  HW_L2_WM,
+  HW_NOC,
+  HW_PIPE_DUTY,
+  HW_NUM_SM_IDLE,
+  HW_CYCLES,
+  HW_VOLTAGE,
+  HW_TOTAL_STATS
+};
 
 struct power_config {
   power_config() { m_valid = true; }
@@ -82,7 +135,8 @@ struct power_config {
       s++;
     }
     char buf1[1024];
-    snprintf(buf1, 1024, "gpgpusim_power_report__%s.log", date);
+    //snprintf(buf1, 1024, "accelwattch_power_report__%s.log", date);
+    snprintf(buf1, 1024, "accelwattch_power_report.log");
     g_power_filename = strdup(buf1);
     char buf2[1024];
     snprintf(buf2, 1024, "gpgpusim_power_trace_report__%s.log.gz", date);
@@ -94,6 +148,9 @@ struct power_config {
     snprintf(buf4, 1024, "gpgpusim_steady_state_tracking_report__%s.log.gz",
              date);
     g_steady_state_tracking_filename = strdup(buf4);
+    // for(int i =0; i< hw_perf_t::HW_TOTAL_STATS; i++){
+    //   accelwattch_hybrid_configuration[i] = 0;
+    // }
 
     if (g_steady_power_levels_enabled) {
       sscanf(gpu_steady_state_definition, "%lf:%lf",
@@ -102,9 +159,9 @@ struct power_config {
 
     // NOTE: After changing the nonlinear model to only scaling idle core,
     // NOTE: The min_inc_per_active_sm is not used any more
-    if (g_use_nonlinear_model)
-      sscanf(gpu_nonlinear_model_config, "%lf:%lf", &gpu_idle_core_power,
-             &gpu_min_inc_per_active_sm);
+    //if (g_use_nonlinear_model)
+    //  sscanf(gpu_nonlinear_model_config, "%lf:%lf", &gpu_idle_core_power,
+    //         &gpu_min_inc_per_active_sm);
   }
   void reg_options(class OptionParser *opp);
 
@@ -125,6 +182,14 @@ struct power_config {
   double gpu_steady_power_deviation;
   double gpu_steady_min_period;
 
+
+  char *g_hw_perf_file_name;
+  char *g_hw_perf_bench_name;
+  int g_power_simulation_mode;
+  bool g_dvfs_enabled;
+  bool g_aggregate_power_stats;
+  bool accelwattch_hybrid_configuration[hw_perf_t::HW_TOTAL_STATS];
+
   // Nonlinear power model
   bool g_use_nonlinear_model;
   char *gpu_nonlinear_model_config;
@@ -139,6 +204,12 @@ class memory_config {
     gpgpu_dram_timing_opt = NULL;
     gpgpu_L2_queue_config = NULL;
     gpgpu_ctx = ctx;
+
+    page_size_list  = nullptr;
+    cta_sched_list  = nullptr;
+    cta_batch_list  = nullptr;
+    data_sched_list = nullptr;
+    data_batch_list = nullptr;
   }
   void init() {
     assert(gpgpu_dram_timing_opt);
@@ -226,16 +297,93 @@ class memory_config {
     fprintf(stdout, "Total number of memory sub partition = %u\n",
             m_n_mem_sub_partition);
 
-    m_address_mapping.init(m_n_mem, m_n_sub_partition_per_memory_channel);
+    m_address_mapping.init(m_n_mem, m_n_sub_partition_per_memory_channel, this);
     m_L2_config.init(&m_address_mapping);
 
     m_valid = true;
+
+    /*****************/
+    tlb_levels = 0;
+    std::string mask(va_mask);
+    for(unsigned i = 0; i < mask.size(); i++) {
+        if (tlb_levels < static_cast<unsigned>(mask[i] - '0'))
+            tlb_levels = mask[i] - '0';
+    }
+
+    page_sizes = new std::vector<uint64_t>;
+    page_sizes->push_back(DRAM_size); //Set DRAM size as the biggest page
+    std::stringstream strm(page_size_list);
+    std::string temp;
+    while(std::getline(strm, temp, ':')){
+        page_sizes->push_back(std::stoul(temp));
+    }
+    printf("Done parsing page_size list, the list is: [");
+    for(std::vector<uint64_t>::const_iterator itr = page_sizes->begin(); itr != page_sizes->end(); ++itr) {
+        printf("%lu, ",*itr);
+        base_page_size = *itr;
+        page_size = LOGB2(*itr);
+    }
+    printf("]. Number of TLB levels = %d, base_page_size = %d\n", tlb_levels, base_page_size);
+    printf("Done parsing DRAM options\n");
+
+    cta_sched_map = new std::vector<uint64_t>;
+    std::stringstream cta_sched_parse(cta_sched_list);
+    std::string cta_sched_temp;
+    while(std::getline(cta_sched_parse, cta_sched_temp, ':')) {
+        cta_sched_map->push_back(std::stoul(cta_sched_temp));
+    }
+    printf("Done parsing CTA sched, the list is: [");
+    for(std::vector<uint64_t>::const_iterator itr = cta_sched_map->begin(); itr != cta_sched_map->end(); ++itr) {
+        printf("%lu, ",*itr);
+    }
+    printf("]\n");
+
+    cta_batch_map = new std::vector<uint64_t>;
+    std::stringstream cta_batch_parse(cta_batch_list);
+    std::string cta_batch_temp;
+    while(std::getline(cta_batch_parse, cta_batch_temp, ':')) {
+        cta_batch_map->push_back(std::stoul(cta_batch_temp));
+    }
+    printf("Done parsing CTA batch, the list is: [");
+    for(std::vector<uint64_t>::const_iterator itr = cta_batch_map->begin(); itr != cta_batch_map->end(); ++itr) {
+        printf("%lu, ",*itr);
+    }
+    printf("]\n");
+
+    data_sched_map = new std::vector<uint64_t>;
+    std::stringstream data_sched_parse(data_sched_list);
+    std::string data_sched_temp;
+    while(std::getline(data_sched_parse, data_sched_temp, ':')) {
+        data_sched_map->push_back(std::stoul(data_sched_temp));
+    }
+    printf("Done parsing data sched, the list is: [");
+    for(std::vector<uint64_t>::const_iterator itr = data_sched_map->begin(); itr != data_sched_map->end(); ++itr) {
+        printf("%lu, ",*itr);
+    }
+    printf("]\n");
+
+    data_batch_map = new std::vector<uint64_t>;
+    std::stringstream data_batch_parse(data_batch_list);
+    std::string data_batch_temp;
+    while(std::getline(data_batch_parse, data_batch_temp, ':')) {
+        data_batch_map->push_back(std::stoul(data_batch_temp));
+    }
+    printf("Done parsing data batch, the list is: [");
+    for(std::vector<uint64_t>::const_iterator itr = data_batch_map->begin(); itr != data_batch_map->end(); ++itr) {
+        printf("%lu, ",*itr);
+    }
+    printf("]\n");
+    /*****************/
 
     sscanf(write_queue_size_opt, "%d:%d:%d",
            &gpgpu_frfcfs_dram_write_queue_size, &write_high_watermark,
            &write_low_watermark);
   }
   void reg_options(class OptionParser *opp);
+
+  void set_mmu(mmu * page_manager){
+      m_address_mapping.set_mmu(page_manager);
+  }
 
   bool m_valid;
   mutable l2_cache_config m_L2_config;
@@ -246,6 +394,9 @@ class memory_config {
   bool l2_ideal;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
+
+  int gpgpu_num_groups;
+
   enum dram_ctrl_t scheduler_type;
   bool gpgpu_memlatency_stat;
   unsigned m_n_mem;
@@ -303,6 +454,86 @@ class memory_config {
 
   unsigned icnt_flit_size;
 
+  /****************************************************************************/
+  unsigned tlb_levels;
+  unsigned page_size;
+  unsigned base_page_size;
+  char * page_size_list;
+  std::vector<uint64_t> * page_sizes;
+  unsigned pages_in_chunk;
+  uint64_t DRAM_size;
+
+  char * va_mask;
+  enum virtual_memory_config vm_config;
+
+  unsigned l1_tlb_port;
+  unsigned tlb_size;
+  unsigned l1_tlb_latency;
+  unsigned L1_TLB_MSHR_entry;
+  unsigned L1_TLB_MSHR_merge;
+
+  unsigned l2_tlb_ports;
+  unsigned l2_tlb_latency;
+  unsigned l2_tlb_entries;
+  unsigned l2_tlb_ways;
+  unsigned L2_TLB_MSHR_entry;
+  unsigned L2_TLB_MSHR_merge;
+
+  unsigned num_page_walkers;
+  unsigned page_walk_queue_depth;
+
+  unsigned pw_cache_latency;
+  unsigned pw_cache_num_ports;
+  unsigned tlb_pw_cache_entries;
+  unsigned tlb_pw_cache_ways;
+
+  unsigned set_page_size;
+  bool enable_walk_fault;
+  bool enable_pte_rr;
+
+  bool dram_stat_enable;
+
+  unsigned chiplet_num;
+  unsigned total_sm_num;
+
+  unsigned mcm_cta_schedule;
+  unsigned cta_batch;
+
+  unsigned mcm_data_schedule;
+  unsigned data_type_byte;
+  unsigned data_batch;
+
+  uint64_t link_latency;
+  unsigned link_bandwidth;
+  unsigned link_frequency;
+  unsigned link_tx_depth;
+  unsigned link_arrive_depth;
+
+  unsigned noc_gateway_depth;
+  unsigned noc_push_depth;
+  unsigned noc_receive_depth;
+
+  bool static_cta_multi_enable;
+  char * cta_sched_list;
+  char * cta_batch_list;
+  std::vector<uint64_t> * cta_sched_map;
+  std::vector<uint64_t> * cta_batch_map;
+
+  bool static_data_multi_enable;
+  char * data_sched_list;
+  char * data_batch_list;
+  std::vector<uint64_t> * data_sched_map;
+  std::vector<uint64_t> * data_batch_map;
+
+  float trigger_balancing;
+  float remote_thres;
+  float balancing_thres;
+
+  unsigned mem_config;
+  bool enable_mem_side;
+  bool enable_remote_debug;
+  /****************************************************************************/
+
   unsigned dram_bnk_indexing_policy;
   unsigned dram_bnkgrp_indexing_policy;
   bool dual_bus_interface;
@@ -330,7 +561,7 @@ class gpgpu_sim_config : public power_config,
   }
   void reg_options(class OptionParser *opp);
   void init() {
-    gpu_stat_sample_freq = 10000;
+    gpu_stat_sample_freq = 10000000;
     gpu_runtime_stat_flag = 0;
     sscanf(gpgpu_runtime_stat, "%d:%x", &gpu_stat_sample_freq,
            &gpu_runtime_stat_flag);
@@ -358,6 +589,12 @@ class gpgpu_sim_config : public power_config,
     m_valid = true;
   }
 
+  void set_mmu(mmu * page_manager){
+      m_memory_config.set_mmu(page_manager);
+  }
+  memory_config * get_mem_config(){ return &m_memory_config; }
+
+  unsigned get_core_freq() const { return core_freq; }
   unsigned num_shader() const { return m_shader_config.num_shader(); }
   unsigned num_cluster() const { return m_shader_config.n_simt_clusters; }
   unsigned get_max_concurrent_kernel() const { return max_concurrent_kernel; }
@@ -481,6 +718,10 @@ class gpgpu_sim : public gpgpu_t {
  public:
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
 
+  void reset_cta_schedule();
+  void set_up_sched_list();
+  void increase_sched_count();
+
   void set_prop(struct cudaDeviceProp *prop);
 
   void launch(kernel_info_t *kinfo);
@@ -502,7 +743,7 @@ class gpgpu_sim : public gpgpu_t {
            (m_config.gpu_max_completed_cta_opt &&
             (gpu_completed_cta >= m_config.gpu_max_completed_cta_opt));
   }
-  void print_stats();
+  void print_stats(unsigned long long streamID);
   void update_stats();
   void deadlock_check();
   void inc_completed_cta() { gpu_completed_cta++; }
@@ -527,10 +768,11 @@ class gpgpu_sim : public gpgpu_t {
   bool kernel_more_cta_left(kernel_info_t *kernel) const;
   bool hit_max_cta_count() const;
   kernel_info_t *select_kernel();
+  PowerscalingCoefficients *get_scaling_coeffs();
   void decrement_kernel_latency();
 
   const gpgpu_sim_config &get_config() const { return m_config; }
-  void gpu_print_stat();
+  void gpu_print_stat(unsigned long long streamID);
   void dump_pipeline(int mask, int s, int m) const;
 
   void perf_memcpy_to_gpu(size_t dst_start_addr, size_t count);
@@ -565,11 +807,25 @@ class gpgpu_sim : public gpgpu_t {
   // backward pointer
   class gpgpu_context *gpgpu_ctx;
 
+  void print_period_stat();
+  void gpu_print_stat_file(unsigned long long streamID, FILE *outputfile);
+  void print_stat_file(unsigned long long streamID);
+
+  unsigned long long get_elapsed_time();
+  void flush_caches(new_addr_type vpn_64);
+
+  mmu* get_page_manager() { return m_page_manager; }
+  tlb_tag_array* get_shared_tlb() { return m_shared_tlb; }
+  inter_noc* get_inter_noc() { return m_inter_noc; }
+
  private:
   // clocks
   void reinit_clock_domains(void);
   int next_clock_domain(void);
+
   void issue_block2core();
+  void issue_block2core(bool chiplet, unsigned mode, unsigned batch);
+
   void print_dram_stats(FILE *fout) const;
   void shader_print_runtime_stat(FILE *fout);
   void shader_print_l1_miss_stat(FILE *fout) const;
@@ -579,6 +835,21 @@ class gpgpu_sim : public gpgpu_t {
   void print_shader_cycle_distro(FILE *fout) const;
 
   void gpgpu_debug();
+
+  mmu * m_page_manager;
+  tlb_tag_array * m_shared_tlb;
+  inter_noc * m_inter_noc;
+
+  unsigned m_sm_chiplet_base  = 0;
+  unsigned m_sub_chiplet_base = 0;
+
+  bool sched_list_setup = false;
+  unsigned sched_count = 0;
+  unsigned cta_sched_mode = -1;
+  unsigned cta_batch_mode = -1;
+
+  std::list<uint64_t> * cta_sched_list = nullptr;
+  std::list<uint64_t> * cta_batch_list = nullptr;
 
  protected:
   ///// data /////
@@ -634,6 +905,7 @@ class gpgpu_sim : public gpgpu_t {
 
   std::string executed_kernel_info_string();  //< format the kernel information
                                               // into a string for stat printout
+  std::string executed_kernel_name();
   void clear_executed_kernel_info();  //< clear the kernel information after
                                       // stat printout
   virtual void createSIMTCluster() = 0;
@@ -645,6 +917,17 @@ class gpgpu_sim : public gpgpu_t {
   unsigned gpu_sim_insn_last_update_sid;
   occupancy_stats gpu_occupancy;
   occupancy_stats gpu_tot_occupancy;
+
+  typedef struct {
+    unsigned long long start_cycle;
+    unsigned long long end_cycle;
+  } kernel_time_t;
+  std::map<unsigned long long, std::map<unsigned, kernel_time_t>>
+      gpu_kernel_time;
+  unsigned long long last_streamID;
+  unsigned long long last_uid;
+  cache_stats aggregated_l1_stats;
+  cache_stats aggregated_l2_stats;
 
   // performance counter for stalls due to congestion.
   unsigned int gpu_stall_dramfull;
@@ -673,6 +956,9 @@ class gpgpu_sim : public gpgpu_t {
  public:
   bool is_functional_sim() { return m_functional_sim; }
   kernel_info_t *get_functional_kernel() { return m_functional_sim_kernel; }
+  std::vector<kernel_info_t *> get_running_kernels() {
+    return m_running_kernels;
+  }
   void functional_launch(kernel_info_t *k) {
     m_functional_sim = true;
     m_functional_sim_kernel = k;

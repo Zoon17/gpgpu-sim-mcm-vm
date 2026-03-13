@@ -70,6 +70,9 @@ ifeq ($(GNUC_CPP0X), 1)
     CXXFLAGS = -std=c++0x
 endif
 
+# jun: Makefile update
+CXX_L ?= g++
+CC_L  ?= gcc
 
 CPP = g++ $(SNOW)
 CC = gcc $(SNOW)

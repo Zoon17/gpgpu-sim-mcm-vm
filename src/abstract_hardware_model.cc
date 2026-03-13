@@ -1,18 +1,25 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Inderpreet Singh, Timothy Rogers,
-// The University of British Columbia
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
+// Copyright (c) 2009-2021, Tor M. Aamodt, Inderpreet Singh, Timothy Rogers, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -25,6 +32,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+
 
 #include "abstract_hardware_model.h"
 #include <sys/stat.h>
@@ -40,18 +48,22 @@
 #include "gpgpusim_entrypoint.h"
 #include "option_parser.h"
 
+#define APP_ID 1
+
 void mem_access_t::init(gpgpu_context *ctx) {
   gpgpu_ctx = ctx;
   m_uid = ++(gpgpu_ctx->sm_next_access_uid);
   m_addr = 0;
   m_req_size = 0;
 }
+
 void warp_inst_t::issue(const active_mask_t &mask, unsigned warp_id,
                         unsigned long long cycle, int dynamic_warp_id,
-                        int sch_id) {
+                        int sch_id, unsigned long long streamID) {
   m_warp_active_mask = mask;
   m_warp_issued_mask = mask;
   m_uid = ++(m_config->gpgpu_ctx->warp_inst_sm_next_uid);
+  m_streamID = streamID;
   m_warp_id = warp_id;
   m_dynamic_warp_id = dynamic_warp_id;
   issue_cycle = cycle;
@@ -72,7 +84,7 @@ void checkpoint::load_global_mem(class memory_space *temp_mem, char *f1name) {
   FILE *fp2 = fopen(f1name, "r");
   assert(fp2 != NULL);
   char line[128]; /* or other suitable maximum line size */
-  unsigned int offset;
+  unsigned int offset = 0;
   while (fgets(line, sizeof line, fp2) != NULL) /* read a line */
   {
     unsigned int index;
@@ -91,7 +103,7 @@ void checkpoint::load_global_mem(class memory_space *temp_mem, char *f1name) {
       std::stringstream ss;
       ss << std::hex << pch;
       ss >> data;
-      temp_mem->write_only(offset, index, 4, &data);
+      temp_mem->write_only(offset, index, 4, &data, APP_ID);
       offset = offset + 4;
     }
     // fputs ( line, stdout ); /* write the line */
@@ -182,6 +194,9 @@ gpgpu_t::gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx)
   m_surf_mem = new memory_space_impl<8192>("surf", 64 * 1024);
 
   m_dev_malloc = GLOBAL_HEAP_START;
+  m_mmu = ctx->the_gpgpusim->g_mmu;
+  gpu_malloc_init();
+
   checkpoint_option = m_function_model_config.get_checkpoint_option();
   checkpoint_kernel = m_function_model_config.get_checkpoint_kernel();
   checkpoint_CTA = m_function_model_config.get_checkpoint_CTA();
@@ -205,8 +220,8 @@ gpgpu_t::gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx)
   gpu_tot_sim_cycle = 0;
 }
 
-address_type line_size_based_tag_func(new_addr_type address,
-                                      new_addr_type line_size) {
+new_addr_type line_size_based_tag_func(new_addr_type address,
+                                       new_addr_type line_size) {
   // gives the tag for an address based on a given line size
   return address & ~(line_size - 1);
 }
@@ -281,14 +296,16 @@ void warp_inst_t::broadcast_barrier_reduction(
 void warp_inst_t::generate_mem_accesses() {
   if (empty() || op == MEMORY_BARRIER_OP || m_mem_accesses_created) return;
   if (!((op == LOAD_OP) || (op == TENSOR_CORE_LOAD_OP) || (op == STORE_OP) ||
-        (op == TENSOR_CORE_STORE_OP)))
+        (op == TENSOR_CORE_STORE_OP) ))
     return;
   if (m_warp_active_mask.count() == 0) return;  // predicated off
 
   const size_t starting_queue_size = m_accessq.size();
 
   assert(is_load() || is_store());
-  assert(m_per_scalar_thread_valid);  // need address information per thread
+
+  //if((space.get_type() != tex_space) && (space.get_type() != const_space))
+    assert(m_per_scalar_thread_valid);  // need address information per thread
 
   bool is_write = is_store();
 
@@ -448,7 +465,8 @@ void warp_inst_t::generate_mem_accesses() {
     for (unsigned thread = 0; thread < m_config->warp_size; thread++) {
       if (!active(thread)) continue;
       new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
-      unsigned block_address = line_size_based_tag_func(addr, cache_block_size);
+      new_addr_type block_address =
+          line_size_based_tag_func(addr, cache_block_size);
       accesses[block_address].set(thread);
       unsigned idx = addr - block_address;
       for (unsigned i = 0; i < data_size; i++) byte_mask.set(idx + i);
@@ -530,7 +548,8 @@ void warp_inst_t::memory_coalescing_arch(bool is_write,
            (m_per_scalar_thread[thread].memreqaddr[access] != 0);
            access++) {
         new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[access];
-        unsigned block_address = line_size_based_tag_func(addr, segment_size);
+        new_addr_type block_address =
+            line_size_based_tag_func(addr, segment_size);
         unsigned chunk =
             (addr & 127) / 32;  // which 32-byte chunk within in a 128-byte
                                 // chunk does this thread access?
@@ -552,7 +571,8 @@ void warp_inst_t::memory_coalescing_arch(bool is_write,
         if (block_address != line_size_based_tag_func(
                                  addr + data_size_coales - 1, segment_size)) {
           addr = addr + data_size_coales - 1;
-          unsigned block_address = line_size_based_tag_func(addr, segment_size);
+          new_addr_type block_address =
+              line_size_based_tag_func(addr, segment_size);
           unsigned chunk = (addr & 127) / 32;
           transaction_info &info = subwarp_transactions[block_address];
           info.chunks.set(chunk);
@@ -625,7 +645,8 @@ void warp_inst_t::memory_coalescing_arch_atomic(bool is_write,
       if (!active(thread)) continue;
 
       new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
-      unsigned block_address = line_size_based_tag_func(addr, segment_size);
+      new_addr_type block_address =
+          line_size_based_tag_func(addr, segment_size);
       unsigned chunk =
           (addr & 127) / 32;  // which 32-byte chunk within in a 128-byte chunk
                               // does this thread access?
@@ -746,7 +767,9 @@ void warp_inst_t::completed(unsigned long long cycle) const {
 }
 
 kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
-                             class function_info *entry) {
+                             class function_info *entry,
+                             unsigned long long streamID) {
+  //stream_id = 0;
   m_kernel_entry = entry;
   m_grid_dim = gridDim;
   m_block_dim = blockDim;
@@ -756,6 +779,7 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
   m_next_tid = m_next_cta;
   m_num_cores_running = 0;
   m_uid = (entry->gpgpu_ctx->kernel_info_m_next_uid)++;
+  m_streamID = streamID;
   m_param_mem = new memory_space_impl<8192>("param", 64 * 1024);
 
   // Jin: parent and child kernel management for CDP
@@ -769,6 +793,10 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
       num_blocks() * entry->gpgpu_ctx->device_runtime->g_TB_launch_latency;
 
   cache_config_set = false;
+  m_chiplet_set = false;
+  m_tot_chiplet = 0;
+
+  m_parse_traces_init = false;
 }
 
 /*A snapshot of the texture mappings needs to be stored in the kernel's info as
@@ -802,6 +830,10 @@ kernel_info_t::kernel_info_t(
   cache_config_set = false;
   m_NameToCudaArray = nameToCudaArray;
   m_NameToTextureInfo = nameToTextureInfo;
+
+  m_chiplet_set = false;
+  m_tot_chiplet = 0;
+  m_parse_traces_init = false;
 }
 
 kernel_info_t::~kernel_info_t() {
@@ -997,13 +1029,13 @@ void simt_stack::print(FILE *fout) const {
     }
     for (unsigned j = 0; j < m_warp_size; j++)
       fprintf(fout, "%c", (stack_entry.m_active_mask.test(j) ? '1' : '0'));
-    fprintf(fout, " pc: 0x%03x", stack_entry.m_pc);
+    fprintf(fout, " pc: 0x%03llx", stack_entry.m_pc);
     if (stack_entry.m_recvg_pc == (unsigned)-1) {
       fprintf(fout, " rp: ---- tp: %s cd: %2u ",
               (stack_entry.m_type == STACK_ENTRY_TYPE_CALL ? "C" : "N"),
               stack_entry.m_calldepth);
     } else {
-      fprintf(fout, " rp: %4u tp: %s cd: %2u ", stack_entry.m_recvg_pc,
+      fprintf(fout, " rp: %4llu tp: %s cd: %2u ", stack_entry.m_recvg_pc,
               (stack_entry.m_type == STACK_ENTRY_TYPE_CALL ? "C" : "N"),
               stack_entry.m_calldepth);
     }
@@ -1023,7 +1055,7 @@ void simt_stack::print_checkpoint(FILE *fout) const {
 
     for (unsigned j = 0; j < m_warp_size; j++)
       fprintf(fout, "%c ", (stack_entry.m_active_mask.test(j) ? '1' : '0'));
-    fprintf(fout, "%d %d %d %lld %d ", stack_entry.m_pc,
+    fprintf(fout, "%llu %d %llu %lld %d ", stack_entry.m_pc,
             stack_entry.m_calldepth, stack_entry.m_recvg_pc,
             stack_entry.m_branch_div_cycle, stack_entry.m_type);
     fprintf(fout, "%d %d\n", m_warp_id, m_warp_size);
@@ -1239,4 +1271,331 @@ void core_t::initilizeSIMTStack(unsigned warp_count, unsigned warp_size) {
 void core_t::get_pdom_stack_top_info(unsigned warpId, unsigned *pc,
                                      unsigned *rpc) const {
   m_simt_stack[warpId]->get_pdom_stack_top_info(pc, rpc);
+}
+
+#define CTA_DEBUG 0
+
+// set chiplet cta information
+void kernel_info_t::set_chiplet_cta(unsigned int chiplet, unsigned mode, unsigned batch_size) {
+  switch (mode) {
+    case CTA_DISTRIBUTED:
+    case CTA_KERNEL_WIDE: {
+      fprintf(stderr, "Kernel Info - CTA dim : (%5d, %5d, %5d), block dim : (%5d, %5d, %5d) \n",
+              m_grid_dim.x, m_grid_dim.y, m_grid_dim.z,
+              m_block_dim.x, m_block_dim.y, m_block_dim.z);
+
+      unsigned total_dim = m_grid_dim.x * m_grid_dim.y * m_grid_dim.z;
+      unsigned total_dim_base = (unsigned)total_dim / chiplet;
+      unsigned total_dim_rest = (unsigned)total_dim % chiplet;
+
+      if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling baseline   = x: %8d y: %8d z: %8d\n", m_grid_dim.x, m_grid_dim.y, m_grid_dim.z);
+
+      unsigned dim_count = 0;
+      for (auto i = 0u; i < chiplet+1; i++){
+        unsigned x_dim_chiplet = 0;
+        unsigned y_dim_chiplet = 0;
+        unsigned z_dim_chiplet = 0;
+
+        if (i == chiplet+1) assert(dim_count == total_dim);
+
+        if (i == 0){
+          x_dim_chiplet = 0;
+          dim_count += total_dim_base;
+          if (total_dim_rest != 0) {
+            dim_count += 1;
+            total_dim_rest -= 1;
+          }
+        } else {
+          x_dim_chiplet += dim_count;
+          dim_count += total_dim_base;
+          if (total_dim_rest != 0) {
+            dim_count += 1;
+            total_dim_rest -= 1;
+          }
+        }
+
+        if (i == chiplet) { x_dim_chiplet = total_dim; }
+        if (x_dim_chiplet >= m_grid_dim.x){
+          y_dim_chiplet = x_dim_chiplet / m_grid_dim.x;
+          x_dim_chiplet = x_dim_chiplet % m_grid_dim.x;
+          if (y_dim_chiplet >= m_grid_dim.y){
+            z_dim_chiplet = y_dim_chiplet / m_grid_dim.y;
+            y_dim_chiplet = y_dim_chiplet % m_grid_dim.y;
+          }
+        }
+
+        dim3 chiplet_dim;
+        chiplet_dim.x = x_dim_chiplet;
+        chiplet_dim.y = y_dim_chiplet;
+        chiplet_dim.z = z_dim_chiplet;
+
+        if (i != chiplet){
+          m_chiplet_dim3[i] = chiplet_dim;
+          if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling chiplet %2d = x: %8d y: %8d z: %8d\n", i, chiplet_dim.x, chiplet_dim.y, chiplet_dim.z);
+        }
+
+        if (i != 0){ m_chiplet_max_dim3[i-1] = chiplet_dim; }
+      }
+
+      for (auto i = 0u; i < chiplet; i++){
+        dim3 max_dim = m_chiplet_max_dim3[i];
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling max_dim %2d = x: %8d y: %8d z: %8d\n", i, max_dim.x, max_dim.y, max_dim.z);
+      }
+      break;
+    }
+    case CTA_ALIGNMENT: {
+      fprintf(stderr, "Kernel Info - CTA dim : (%5d, %5d, %5d), block dim : (%5d, %5d, %5d) \n",
+              m_grid_dim.x, m_grid_dim.y, m_grid_dim.z,
+              m_block_dim.x, m_block_dim.y, m_block_dim.z);
+
+      unsigned tot_cta_cnt = m_grid_dim.x * m_grid_dim.y * m_grid_dim.z;
+
+      // initialization count map
+      for (unsigned i = 0; i < chiplet; i++) {
+        m_chiplet_cta_max_cnt.insert(std::pair<unsigned, unsigned>(i, 0));
+        m_chiplet_cta_cnt.insert(std::pair<unsigned, unsigned>(i, 0));
+      }
+
+      unsigned cta_alloc = 0;
+      unsigned exit_flag = false;
+      while (!exit_flag){
+        for (unsigned i = 0; i < chiplet; i++) {
+          if ((cta_alloc + batch_size) < tot_cta_cnt) {
+            unsigned current_cnt = m_chiplet_cta_max_cnt[i];
+            m_chiplet_cta_max_cnt[i] = current_cnt + batch_size;
+            cta_alloc += batch_size;
+          } else {
+            unsigned remain_batch = tot_cta_cnt - cta_alloc;
+            unsigned current_cnt = m_chiplet_cta_max_cnt[i];
+            m_chiplet_cta_max_cnt[i] = current_cnt + batch_size;
+            cta_alloc += remain_batch;
+            exit_flag = true;
+            break;
+          }
+        }
+      }
+
+      if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling baseline   = x: %8d y: %8d z: %8d\n", m_grid_dim.x, m_grid_dim.y, m_grid_dim.z);
+      for (unsigned i = 0; i < chiplet; i++) {
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling cnt = %8d\n", m_chiplet_cta_max_cnt[i]);
+      }
+
+      // auto calculate batch size - implement it later
+      /*
+      unsigned block_size = ...
+       */
+
+      for (unsigned i = 0; i < chiplet; i++){
+        // init each chiplet dim3
+        dim3 init_dim;
+        init_dim.x = 0;
+        init_dim.y = 0;
+        init_dim.z = 0;
+
+        unsigned stride = i * batch_size;
+        for (unsigned j = 0; j < stride; j++){
+          increment_x_then_y_then_z(init_dim, m_grid_dim);
+        }
+
+        m_chiplet_dim3[i] = init_dim;
+        dim3 debug_dim = m_chiplet_dim3[i];
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling dim %2d = x: %8d y: %8d z: %8d\n", i, debug_dim.x, debug_dim.y, debug_dim.z);
+      }
+      break;
+    }
+    case CTA_ROW_BIND: {
+      fprintf(stderr, "Kernel Info - CTA dim : (%5d, %5d, %5d), block dim : (%5d, %5d, %5d) \n",
+              m_grid_dim.x, m_grid_dim.y, m_grid_dim.z,
+              m_block_dim.x, m_block_dim.y, m_block_dim.z);
+
+      // initialization count map
+      for (unsigned i = 0; i < chiplet; i++) {
+        m_chiplet_cta_max_cnt.insert(std::pair<unsigned, unsigned>(i, 0));
+        m_chiplet_cta_cnt.insert(std::pair<unsigned, unsigned>(i, 0));
+      }
+
+      assert(m_grid_dim.z == 1);  // simple equation assume
+      unsigned row_per_chiplet      = (unsigned)m_grid_dim.y / chiplet;
+      unsigned row_per_chiplet_rest = (unsigned)m_grid_dim.y % chiplet;
+
+      if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling baseline   = x: %8d y: %8d z: %8d\n", m_grid_dim.x, m_grid_dim.y, m_grid_dim.z);
+
+      unsigned row_sum = 0;
+      for (unsigned i = 0; i < chiplet; i++) {
+        unsigned row_division = 0;
+        row_division += row_per_chiplet;
+        row_sum      += row_per_chiplet;
+        if (row_per_chiplet_rest != 0){
+          row_per_chiplet_rest--;
+          row_division++;
+          row_sum++;
+        }
+        // set max cta cnt
+        unsigned max_cta = (unsigned)m_grid_dim.x * row_division;
+        m_chiplet_cta_max_cnt[i] = max_cta;
+
+        // set cta start dim
+        dim3 init_dim;
+        init_dim.x = 0;
+        init_dim.y = row_sum - row_division;
+        init_dim.z = 0;
+
+        m_chiplet_dim3[i] = init_dim;
+        dim3 debug_dim = m_chiplet_dim3[i];
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling cnt = %8d\n", m_chiplet_cta_max_cnt[i]);
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling dim %2d = x: %8d y: %8d z: %8d\n", i, debug_dim.x, debug_dim.y, debug_dim.z);
+      }
+      break;
+    }
+    case CTA_COLUMN_BIND: {
+      fprintf(stderr, "Kernel Info - CTA dim : (%5d, %5d, %5d), block dim : (%5d, %5d, %5d) \n",
+              m_grid_dim.x, m_grid_dim.y, m_grid_dim.z,
+              m_block_dim.x, m_block_dim.y, m_block_dim.z);
+
+      // initialization count map
+      for (unsigned i = 0; i < chiplet; i++) {
+        m_chiplet_cta_max_cnt.insert(std::pair<unsigned, unsigned>(i, 0));
+        m_chiplet_cta_cnt.insert(std::pair<unsigned, unsigned>(i, 0));
+        m_chiplet_cta_end_col.insert(std::pair<unsigned, unsigned>(i, 0));
+      }
+
+      assert(m_grid_dim.z == 1);  // simple equation assume
+      unsigned col_per_chiplet      = (unsigned)m_grid_dim.x / chiplet;
+      unsigned col_per_chiplet_rest = (unsigned)m_grid_dim.x % chiplet;
+
+      if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling baseline   = x: %8d y: %8d z: %8d\n", m_grid_dim.x, m_grid_dim.y, m_grid_dim.z);
+
+      unsigned col_sum = 0;
+      for (unsigned i = 0; i < chiplet; i++) {
+        m_chiplet_cta_start_col[i] = col_sum;  // set start column count
+
+        unsigned col_division = 0;
+        col_division += col_per_chiplet;
+        col_sum      += col_per_chiplet;
+        if (col_per_chiplet_rest != 0){
+          col_per_chiplet_rest--;
+          col_division++;
+          col_sum++;
+        }
+        // set max cta cnt
+        unsigned max_cta = (unsigned)m_grid_dim.y * col_division;
+        m_chiplet_cta_max_cnt[i] = max_cta;
+        m_chiplet_cta_end_col[i] = col_sum;  // set end column count
+
+        // set cta start dim
+        dim3 init_dim;
+        init_dim.x = col_sum - col_division;
+        init_dim.y = 0;
+        init_dim.z = 0;
+
+        m_chiplet_dim3[i] = init_dim;
+        dim3 debug_dim = m_chiplet_dim3[i];
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling cnt = %8d\n", m_chiplet_cta_max_cnt[i]);
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA scheduling dim %2d = x: %8d y: %8d z: %8d\n", i, debug_dim.x, debug_dim.y, debug_dim.z);
+        if (CTA_DEBUG) fprintf(stderr, "MCM - CTA column bind = %8d - %8d\n", m_chiplet_cta_start_col[i], m_chiplet_cta_end_col[i]);
+      }
+      break;
+    }
+    default:
+      assert(0 && "Should not reach here!");
+  }
+}
+
+bool kernel_info_t::have_more_chiplet_cta(unsigned int chiplet, unsigned mode) {
+  if (mode == CTA_DISTRIBUTED || mode == CTA_KERNEL_WIDE) {
+    dim3 current_dim = m_chiplet_dim3[chiplet];
+    dim3 max_dim     = m_chiplet_max_dim3[chiplet];
+
+    unsigned current_id = current_dim.x + current_dim.y * m_grid_dim.x + current_dim.z * m_grid_dim.x * m_grid_dim.y;
+    unsigned max_id     =     max_dim.x +     max_dim.y * m_grid_dim.x +     max_dim.z * m_grid_dim.x * m_grid_dim.y;
+    return current_id < max_id;
+  } else {
+    uint64_t current_cnt = m_chiplet_cta_cnt[chiplet];
+    uint64_t max_cnt     = m_chiplet_cta_max_cnt[chiplet];
+    return current_cnt < max_cnt;
+  }
+}
+
+unsigned kernel_info_t::get_next_cta_id_single(unsigned int chiplet, unsigned mode, unsigned batch) {
+  switch (mode) {
+    case CTA_DISTRIBUTED:
+    case CTA_KERNEL_WIDE:
+    case CTA_ALIGNMENT:
+    case CTA_ROW_BIND:
+    case CTA_COLUMN_BIND: {
+      dim3 chiplet_dim = m_chiplet_dim3[chiplet];
+      return chiplet_dim.x +
+             m_grid_dim.x * chiplet_dim.y +
+             m_grid_dim.x * m_grid_dim.y * chiplet_dim.z;
+    }
+    default:
+      assert(0 && 'Should not reach here!');
+  }
+}
+
+dim3 kernel_info_t::get_next_cta_id(unsigned int chiplet) {
+  dim3 chiplet_dim = m_chiplet_dim3[chiplet];
+  return chiplet_dim;
+}
+
+void kernel_info_t::increment_cta_id(unsigned int chiplet, unsigned mode, unsigned batch) {
+  switch (mode) {
+    case CTA_DISTRIBUTED:
+    case CTA_KERNEL_WIDE: {
+      increment_x_then_y_then_z(m_chiplet_dim3[chiplet], m_grid_dim);
+      m_next_tid.x = 0;
+      m_next_tid.y = 0;
+      m_next_tid.z = 0;
+      break;
+    }
+    case CTA_ALIGNMENT: {
+      unsigned current_cnt = m_chiplet_cta_cnt[chiplet];
+      if ((current_cnt+1) % batch == 0) {
+        unsigned increase_cnt = batch * (m_tot_chiplet - 1) + 1;
+        assert(increase_cnt != 0);
+        for (unsigned i = 0; i < increase_cnt; i++){
+          increment_x_then_y_then_z(m_chiplet_dim3[chiplet], m_grid_dim);
+        }
+      } else {
+        increment_x_then_y_then_z(m_chiplet_dim3[chiplet], m_grid_dim);
+      }
+      m_chiplet_cta_cnt[chiplet] = current_cnt+1;  // increment cta counter
+      m_next_tid.x = 0;
+      m_next_tid.y = 0;
+      m_next_tid.z = 0;
+      break;
+    }
+    case CTA_ROW_BIND: {
+      unsigned current_cnt = m_chiplet_cta_cnt[chiplet];
+      m_chiplet_cta_cnt[chiplet] = current_cnt+1;  // increment cta counter
+      increment_x_then_y_then_z(m_chiplet_dim3[chiplet], m_grid_dim);
+      m_next_tid.x = 0;
+      m_next_tid.y = 0;
+      m_next_tid.z = 0;
+      break;
+    }
+    case CTA_COLUMN_BIND: {
+      unsigned current_cnt = m_chiplet_cta_cnt[chiplet];
+      m_chiplet_cta_cnt[chiplet] = current_cnt+1;  // increment cta counter
+
+      dim3 current_dim = m_chiplet_dim3[chiplet];
+      if (current_dim.x == m_chiplet_cta_end_col[chiplet]){
+        current_dim.x = m_chiplet_cta_start_col[chiplet];
+        current_dim.y += 1;
+        if (current_dim.y >= m_grid_dim.y){
+          current_dim.y = 0;
+          current_dim.z += 1;
+        }
+        m_chiplet_dim3[chiplet] = current_dim;
+      } else {
+        increment_x_then_y_then_z(m_chiplet_dim3[chiplet], m_grid_dim);
+      }
+      m_next_tid.x = 0;
+      m_next_tid.y = 0;
+      m_next_tid.z = 0;
+      break;
+    }
+    default:
+      assert(0 && 'Should not reach here!');
+  }
 }

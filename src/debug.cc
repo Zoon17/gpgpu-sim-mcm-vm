@@ -37,6 +37,8 @@
 #include <string.h>
 #include <map>
 
+#define APP_ID 1
+
 void gpgpu_sim::hit_watchpoint(unsigned watchpoint_num, ptx_thread_info *thd,
                                const ptx_instruction *pI) {
   g_watchpoint_hits[watchpoint_num] = watchpoint_event(thd, pI);
@@ -66,7 +68,7 @@ void gpgpu_sim::gpgpu_debug() {
     if (b.is_watchpoint()) {
       unsigned addr = b.get_addr();
       unsigned new_value;
-      m_global_mem->read(addr, 4, &new_value);
+      m_global_mem->read(addr, 4, &new_value, APP_ID);
       if (new_value != b.get_value() ||
           g_watchpoint_hits.find(num) != g_watchpoint_hits.end()) {
         printf(
@@ -124,7 +126,7 @@ void gpgpu_sim::gpgpu_debug() {
     fflush(stdout);
 
     char line[1024];
-    fgets(line, 1024, stdin);
+    char * ptr = fgets(line, 1024, stdin);
 
     char *tok = strtok(line, " \t\n");
     if (!strcmp(tok, "dp")) {
@@ -136,7 +138,11 @@ void gpgpu_sim::gpgpu_debug() {
       fflush(stdout);
     } else if (!strcmp(tok, "q") || !strcmp(tok, "quit")) {
       printf("\nreally quit GPGPU-Sim (y/n)?\n");
-      fgets(line, 1024, stdin);
+      ptr = fgets(line, 1024, stdin);
+      if(ptr == NULL ){
+        printf("can't read input\n");
+        exit(0);
+      }
       tok = strtok(line, " \t\n");
       if (!strcmp(tok, "y")) {
         exit(0);
@@ -166,7 +172,7 @@ void gpgpu_sim::gpgpu_debug() {
       unsigned addr;
       sscanf(tok, "%x", &addr);
       unsigned value;
-      m_global_mem->read(addr, 4, &value);
+      m_global_mem->read(addr, 4, &value, APP_ID);
       m_global_mem->set_watch(addr, next_brkpt);
       breakpoints[next_brkpt++] = brk_pt(addr, value);
     } else if (!strcmp(tok, "l")) {

@@ -50,6 +50,8 @@ typedef address_type mem_addr_t;
 
 #define MEM_BLOCK_SIZE (4 * 1024)
 
+class mmu;
+
 template <unsigned BSIZE>
 class mem_storage {
  public:
@@ -95,10 +97,10 @@ class memory_space {
  public:
   virtual ~memory_space() {}
   virtual void write(mem_addr_t addr, size_t length, const void *data,
-                     ptx_thread_info *thd, const ptx_instruction *pI) = 0;
+                     ptx_thread_info *thd, const ptx_instruction *pI, int appID) = 0;
   virtual void write_only(mem_addr_t index, mem_addr_t offset, size_t length,
-                          const void *data) = 0;
-  virtual void read(mem_addr_t addr, size_t length, void *data) const = 0;
+                          const void *data, int appID) = 0;
+  virtual void read(mem_addr_t addr, size_t length, void *data, int appID) const = 0;
   virtual void print(const char *format, FILE *fout) const = 0;
   virtual void set_watch(addr_t addr, unsigned watchpoint) = 0;
 };
@@ -109,22 +111,25 @@ class memory_space_impl : public memory_space {
   memory_space_impl(std::string name, unsigned hash_size);
 
   virtual void write(mem_addr_t addr, size_t length, const void *data,
-                     ptx_thread_info *thd, const ptx_instruction *pI);
+                     ptx_thread_info *thd, const ptx_instruction *pI, int appID);
   virtual void write_only(mem_addr_t index, mem_addr_t offset, size_t length,
-                          const void *data);
-  virtual void read(mem_addr_t addr, size_t length, void *data) const;
+                          const void *data, int appID);
+  virtual void read(mem_addr_t addr, size_t length, void *data, int appID) const;
   virtual void print(const char *format, FILE *fout) const;
 
   virtual void set_watch(addr_t addr, unsigned watchpoint);
 
  private:
   void read_single_block(mem_addr_t blk_idx, mem_addr_t addr, size_t length,
-                         void *data) const;
+                         void *data, int appID) const;
   std::string m_name;
   unsigned m_log2_block_size;
   typedef mem_map<mem_addr_t, mem_storage<BSIZE> > map_t;
   map_t m_data;
   std::map<unsigned, mem_addr_t> m_watchpoints;
+
+  memory_space_t m_type;
+  int memory_space_ID;
 };
 
 #endif

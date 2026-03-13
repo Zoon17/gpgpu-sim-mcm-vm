@@ -1,3 +1,8 @@
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
 // Copyright (c) 2009-2011, Wilson W.L. Fung, Tor M. Aamodt, Ali Bakhoda,
 // The University of British Columbia
 // All rights reserved.
@@ -32,6 +37,10 @@
 #include "../option_parser.h"
 #include "gpu-sim.h"
 #include "hashing.h"
+#include "dram.h"
+#include "../cuda-sim/cuda-sim.h"
+
+#define max_uint64 (~uint64_t{0})
 
 static long int powli(long int x, long int y);
 static unsigned int LOGB2_32(unsigned int v);
@@ -76,7 +85,16 @@ void linear_to_raw_address_translation::addrdec_setoption(option_parser_t opp) {
 }
 
 new_addr_type linear_to_raw_address_translation::partition_address(
-    new_addr_type addr) const {
+    new_addr_type in_addr, unsigned appID, unsigned level, bool isRead, unsigned chiplet) const {
+  /************************************************/
+  new_addr_type addr;
+  if (level == DRAM_CMD || appID == PT_SPACE){
+    addr = in_addr;
+  } else {
+    addr = m_mmu->get_pa(in_addr, appID, isRead, chiplet);
+  }
+  /************************************************/
+
   if (!gap) {
     return addrdec_packbits(~(addrdec_mask[CHIP] | sub_partition_id_mask), addr,
                             64, 0);
@@ -84,7 +102,7 @@ new_addr_type linear_to_raw_address_translation::partition_address(
     // see addrdec_tlx for explanation
     unsigned long long int partition_addr;
     partition_addr = ((addr >> ADDR_CHIP_S) / m_n_channel) << ADDR_CHIP_S;
-    partition_addr |= addr & ((1 << ADDR_CHIP_S) - 1);
+    partition_addr |= addr & (((new_addr_type)1 << ADDR_CHIP_S) - 1);
     // remove the part of address that constributes to the sub partition ID
     partition_addr =
         addrdec_packbits(~sub_partition_id_mask, partition_addr, 64, 0);
@@ -92,8 +110,21 @@ new_addr_type linear_to_raw_address_translation::partition_address(
   }
 }
 
-void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
-                                                    addrdec_t *tlx) const {
+void linear_to_raw_address_translation::set_mmu(mmu *page_manager) {
+    m_mmu = page_manager;
+}
+
+bool linear_to_raw_address_translation::addrdec_tlx(new_addr_type in_addr,
+                                                    addrdec_t *tlx,
+                                                    unsigned appID, unsigned level, bool isRead, unsigned chiplet) const {
+  tlx->subarray = -1;  // subarray is not used
+  new_addr_type addr;
+  if (level == DRAM_CMD || appID == PT_SPACE){
+    addr = in_addr;
+  } else {
+    addr = m_mmu->get_pa(in_addr, appID, isRead, chiplet);
+  }
+
   unsigned long long int addr_for_chip, rest_of_addr, rest_of_addr_high_bits;
   if (!gap) {
     tlx->chip = addrdec_packbits(addrdec_mask[CHIP], addr, addrdec_mkhigh[CHIP],
@@ -142,7 +173,6 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       break;
     }
     case IPOLY: {
-      // assert(!gap);
       unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
       unsigned sub_partition = tlx->chip * m_n_sub_partition_in_channel +
                                (tlx->bk & sub_partition_addr_mask);
@@ -158,8 +188,7 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       tlx->sub_partition = sub_partition;
       assert(tlx->chip < m_n_channel);
       assert(tlx->sub_partition < m_n_channel * m_n_sub_partition_in_channel);
-      return;
-      break;
+      return false;
     }
     case RANDOM: {
       // This is an unrealistic hashing using software hashtable
@@ -181,23 +210,112 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
 
       assert(tlx->chip < m_n_channel);
       assert(tlx->sub_partition < m_n_channel * m_n_sub_partition_in_channel);
-      return;
-      break;
+      return false;
     }
-    case CUSTOM:
-      /* No custom set function implemented */
-      // Do you custom index here
-      break;
+    case MCM_LOCALITY_AWARE: {
+      unsigned chiplet_num_log = static_cast<unsigned>(log2(static_cast<float>(m_config->chiplet_num)));
+      assert(m_n_channel == (static_cast<unsigned>(16) << chiplet_num_log) &&
+          m_n_sub_partition_in_channel == 2);
+
+      unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
+
+      unsigned physical_shift = static_cast<unsigned>(log2(
+        static_cast<float>(m_n_channel * m_n_sub_partition_in_channel)));
+      unsigned addr_chip_shift = tlx->chip & (unsigned) (
+                                   (static_cast<unsigned>(m_n_channel * m_n_sub_partition_in_channel) >>
+                                    chiplet_num_log) - 1);
+
+      unsigned sub_partition =
+          addr_chip_shift * m_n_sub_partition_in_channel + // adjust chip address
+          (tlx->bk & sub_partition_addr_mask);
+
+      sub_partition = ipoly_hash_function(
+        rest_of_addr_high_bits, sub_partition,
+        (nextPowerOf2_m_n_channel * m_n_sub_partition_in_channel) >>
+        chiplet_num_log);  // adjust bank_set_num
+
+      if (gap) // if it is not 2^n partitions, then take modular
+        sub_partition =
+            sub_partition % (m_n_channel * m_n_sub_partition_in_channel);
+
+      // add chiplet number
+      unsigned dram_size_shift = static_cast<unsigned>(log2(static_cast<float>(m_config->DRAM_size)));
+      unsigned map_chiplet =
+          (addr >> (dram_size_shift - chiplet_num_log)) & (unsigned)(m_config->chiplet_num - 1);
+      // get physical mapped chiplet
+      assert(map_chiplet < m_config->chiplet_num);
+      tlx->map_chiplet = map_chiplet;
+
+      unsigned map_sub_partition =
+          sub_partition | (map_chiplet << (physical_shift - chiplet_num_log));
+
+      //  calculate and set request sub partition
+      unsigned request_sub_partition = sub_partition | (chiplet << (physical_shift - chiplet_num_log));
+      tlx->request_sub_partition = request_sub_partition;
+
+      tlx->chip = map_sub_partition /
+                  m_n_sub_partition_in_channel;
+      tlx->sub_partition = map_sub_partition;
+      assert(tlx->chip < m_n_channel);
+      assert(tlx->sub_partition < m_n_channel * m_n_sub_partition_in_channel);
+      return false;
+    }
+    case MCM_INTERLEAVE: {
+      unsigned chiplet_num_log = static_cast<unsigned>(log2(static_cast<float>(m_config->chiplet_num)));
+      assert(m_n_channel == (static_cast<unsigned>(16) << chiplet_num_log) &&
+          m_n_sub_partition_in_channel == 2);
+
+      unsigned stack_per_chip = 2;
+      unsigned stack_log = static_cast<unsigned>(log2(static_cast<float>(stack_per_chip)));
+
+      unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
+
+      unsigned physical_shift = static_cast<unsigned>(log2(static_cast<float>(m_n_channel * m_n_sub_partition_in_channel)));
+      unsigned addr_chip_shift = tlx->chip & (unsigned)((static_cast<unsigned>(m_n_channel * m_n_sub_partition_in_channel) >> (chiplet_num_log + stack_log)) - 1);
+
+      unsigned sub_partition =
+          addr_chip_shift * m_n_sub_partition_in_channel +  // adjust chip address
+          (tlx->bk & sub_partition_addr_mask);
+
+      sub_partition = ipoly_hash_function(
+          rest_of_addr_high_bits, sub_partition,
+          (nextPowerOf2_m_n_channel * m_n_sub_partition_in_channel) >>
+              (chiplet_num_log + stack_log));  // adjust bank_set_num
+
+      if (gap)  // if it is not 2^n partitions, then take modular
+        sub_partition =
+            sub_partition % (m_n_channel * m_n_sub_partition_in_channel);
+
+      unsigned map_chiplet = static_cast<unsigned>(addr >> static_cast<new_addr_type>(12 + 1)) & (unsigned)(m_config->chiplet_num - 1);  // get physical mapped chiplet
+      unsigned stack   = static_cast<unsigned>(addr >> static_cast<new_addr_type>(12)) & (unsigned)(stack_per_chip - 1);
+      assert(map_chiplet < m_config->chiplet_num);
+      tlx->map_chiplet = map_chiplet;
+
+      sub_partition = sub_partition | (stack << (physical_shift - (chiplet_num_log + stack_log)));
+
+      unsigned map_sub_partition =
+          sub_partition | (map_chiplet << (physical_shift - chiplet_num_log));
+
+      // calculate and set request sub partition
+      unsigned request_sub_partition = sub_partition | (chiplet << (physical_shift - chiplet_num_log));
+      tlx->request_sub_partition = request_sub_partition;
+
+      tlx->chip = map_sub_partition /
+                  m_n_sub_partition_in_channel;
+      tlx->sub_partition = map_sub_partition;
+      assert(tlx->chip < m_n_channel);
+      assert(tlx->sub_partition < m_n_channel * m_n_sub_partition_in_channel);
+      return false;
+    }
     default:
       assert("\nUndefined set index function.\n" && 0);
-      break;
   }
-
   // combine the chip address and the lower bits of DRAM bank address to form
   // the subpartition ID
   unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
   tlx->sub_partition = tlx->chip * m_n_sub_partition_in_channel +
                        (tlx->bk & sub_partition_addr_mask);
+  return false;
 }
 
 void linear_to_raw_address_translation::addrdec_parseoption(
@@ -280,7 +398,10 @@ void linear_to_raw_address_translation::addrdec_parseoption(
 }
 
 void linear_to_raw_address_translation::init(
-    unsigned int n_channel, unsigned int n_sub_partition_in_channel) {
+    unsigned int n_channel, unsigned int n_sub_partition_in_channel, memory_config * config){
+
+  m_config = config;
+
   unsigned i;
   unsigned long long int mask;
   unsigned int nchipbits = ::LOGB2_32(n_channel);
@@ -508,7 +629,7 @@ void linear_to_raw_address_translation::sweep_test() const {
 
   for (new_addr_type raw_addr = 4; raw_addr < sweep_range; raw_addr += 4) {
     addrdec_t tlx;
-    addrdec_tlx(raw_addr, &tlx);
+    addrdec_tlx(raw_addr, &tlx, 999, 0, 1, 0);
 
     history_map_t::iterator h = history_map.find(tlx);
 
@@ -519,11 +640,11 @@ void linear_to_raw_address_translation::sweep_test() const {
           h->second, raw_addr);
       abort();
     } else {
-      assert((int)tlx.chip < m_n_channel);
+      assert(tlx.chip < m_n_channel);
       // ensure that partition_address() returns the concatenated address
       if ((ADDR_CHIP_S != -1 and raw_addr >= (1ULL << ADDR_CHIP_S)) or
           (ADDR_CHIP_S == -1 and raw_addr >= (1ULL << addrdec_mklow[CHIP]))) {
-        assert(raw_addr != partition_address(raw_addr));
+        assert(raw_addr != partition_address(raw_addr, 999, 0, 1, 0));
       }
       history_map[tlx] = raw_addr;
     }
@@ -584,7 +705,7 @@ unsigned next_powerOf2(unsigned n) {
   n = n - 1;
 
   // do till only one bit is left
-  while (n & n - 1) n = n & (n - 1);  // unset rightmost bit
+  while (n & (n - 1)) n = n & (n - 1);  // unset rightmost bit
 
   // n is now a power of two (less than n)
 

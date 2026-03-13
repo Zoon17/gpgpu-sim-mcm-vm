@@ -146,7 +146,10 @@ else ifneq ($(TARGET_ARCH),$(HOST_ARCH))
         HOST_COMPILER ?= powerpc64le-linux-gnu-g++
     endif
 endif
-HOST_COMPILER ?= g++
+
+# jun: Makefile update
+CXX_L ?= g++
+HOST_COMPILER = $(CXX_L)
 NVCC          := $(CUDA_INSTALL_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
 
 # internal flags

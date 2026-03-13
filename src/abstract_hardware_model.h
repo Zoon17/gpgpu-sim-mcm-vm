@@ -1,18 +1,25 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Inderpreet Singh,
-// The University of British Columbia
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
+// Copyright (c) 2009-2021, Tor M. Aamodt, Inderpreet Singh, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -59,15 +66,39 @@ enum _memory_space_t {
   instruction_space
 };
 
+#ifndef COEFF_STRUCT
+#define COEFF_STRUCT
+
+struct PowerscalingCoefficients{
+    double int_coeff;
+    double int_mul_coeff;
+    double int_mul24_coeff;
+    double int_mul32_coeff;
+    double int_div_coeff;
+    double fp_coeff;
+    double dp_coeff;
+    double fp_mul_coeff;
+    double fp_div_coeff;
+    double dp_mul_coeff;
+    double dp_div_coeff;
+    double sqrt_coeff;
+    double log_coeff;
+    double sin_coeff;
+    double exp_coeff;
+    double tensor_coeff;
+    double tex_coeff;
+};
+#endif
+
 enum FuncCache {
   FuncCachePreferNone = 0,
   FuncCachePreferShared = 1,
   FuncCachePreferL1 = 2
 };
 
-enum AdaptiveCache { FIXED = 0, ADAPTIVE_VOLTA = 1 };
+enum AdaptiveCache { FIXED = 0, ADAPTIVE_CACHE = 1 };
 
-#ifdef __cplusplus
+//#ifdef __cplusplus
 
 #include <stdio.h>
 #include <string.h>
@@ -75,8 +106,8 @@ enum AdaptiveCache { FIXED = 0, ADAPTIVE_VOLTA = 1 };
 
 typedef unsigned long long new_addr_type;
 typedef unsigned long long cudaTextureObject_t;
-typedef unsigned address_type;
-typedef unsigned addr_t;
+typedef unsigned long long address_type;
+typedef unsigned long long addr_t;
 
 // the following are operations the timing model can see
 #define SPECIALIZED_UNIT_NUM 8
@@ -134,8 +165,14 @@ enum special_operations_t {
   FP_SQRT_OP,
   FP_LG_OP,
   FP_SIN_OP,
-  FP_EXP_OP
+  FP_EXP_OP,
+  DP_MUL_OP,
+  DP_DIV_OP,
+  DP___OP,
+  TENSOR__OP,
+  TEX__OP
 };
+
 typedef enum special_operations_t
     special_ops;  // Required to identify for the power model
 enum operation_pipeline_t {
@@ -200,7 +237,8 @@ class kernel_info_t {
   //      m_num_cores_running=0;
   //      m_param_mem=NULL;
   //   }
-  kernel_info_t(dim3 gridDim, dim3 blockDim, class function_info *entry);
+  kernel_info_t(dim3 gridDim, dim3 blockDim, class function_info *entry,
+                unsigned long long streamID);
   kernel_info_t(
       dim3 gridDim, dim3 blockDim, class function_info *entry,
       std::map<std::string, const struct cudaArray *> nameToCudaArray,
@@ -236,11 +274,18 @@ class kernel_info_t {
     m_next_tid.y = 0;
     m_next_tid.z = 0;
   }
+
+  void increment_cta_id(unsigned chiplet, unsigned mode, unsigned batch);
+
   dim3 get_next_cta_id() const { return m_next_cta; }
+  dim3 get_next_cta_id(unsigned chiplet);
+
   unsigned get_next_cta_id_single() const {
     return m_next_cta.x + m_grid_dim.x * m_next_cta.y +
            m_grid_dim.x * m_grid_dim.y * m_next_cta.z;
   }
+  unsigned get_next_cta_id_single(unsigned chiplet, unsigned mode, unsigned batch);
+
   bool no_more_ctas_to_run() const {
     return (m_next_cta.x >= m_grid_dim.x || m_next_cta.y >= m_grid_dim.y ||
             m_next_cta.z >= m_grid_dim.z);
@@ -259,6 +304,8 @@ class kernel_info_t {
            m_next_tid.x < m_block_dim.x;
   }
   unsigned get_uid() const { return m_uid; }
+  unsigned long long get_streamID() const { return m_streamID; }
+  std::string get_name() const { return name(); }
   std::string name() const;
 
   std::list<class ptx_thread_info *> &active_threads() {
@@ -285,13 +332,21 @@ class kernel_info_t {
     return t->second;
   }
 
+  unsigned get_grid_dim_x() { return (unsigned)m_grid_dim.x; }
+  unsigned get_grid_dim_y() { return (unsigned)m_grid_dim.y; }
+  unsigned get_grid_dim_z() { return (unsigned)m_grid_dim.z; }
+
+  void set_parse_traces_init() { m_parse_traces_init = true; }
+  bool get_parse_traces_init() const { return m_parse_traces_init; }
+
  private:
   kernel_info_t(const kernel_info_t &);   // disable copy constructor
   void operator=(const kernel_info_t &);  // disable copy operator
 
   class function_info *m_kernel_entry;
 
-  unsigned m_uid;
+  unsigned m_uid;  // Kernel ID
+  unsigned long long m_streamID;
 
   // These maps contain the snapshot of the texture mappings at kernel launch
   std::map<std::string, const struct cudaArray *> m_NameToCudaArray;
@@ -307,6 +362,20 @@ class kernel_info_t {
   std::list<class ptx_thread_info *> m_active_threads;
   class memory_space *m_param_mem;
 
+  // chiplet aware cta scheduling
+  std::map<unsigned, dim3> m_chiplet_dim3;
+  std::map<unsigned, dim3> m_chiplet_max_dim3;
+  bool m_chiplet_set;
+  unsigned m_tot_chiplet;
+
+  std::map<unsigned, unsigned> m_chiplet_cta_cnt;
+  std::map<unsigned, unsigned> m_chiplet_cta_max_cnt;
+
+  std::map<unsigned, unsigned> m_chiplet_cta_start_col;  // use for column-bind scheduling
+  std::map<unsigned, unsigned> m_chiplet_cta_end_col;  // use for column-bind scheduling
+
+  bool m_parse_traces_init;
+
  public:
   // Jin: parent and child kernel management for CDP
   void set_parent(kernel_info_t *parent, dim3 parent_ctaid, dim3 parent_tid);
@@ -321,6 +390,18 @@ class kernel_info_t {
   void destroy_cta_streams();
   void print_parent_info();
   kernel_info_t *get_parent() { return m_parent_kernel; }
+
+  // chiplet aware cta scheduling
+  bool get_chiplet_set() const { return m_chiplet_set; }
+  void set_chiplet_set(unsigned tot_chiplet) {
+    m_tot_chiplet = tot_chiplet;
+    m_chiplet_set = true; }
+  void set_chiplet_cta(unsigned chiplet, unsigned mode, unsigned batch_size);
+  bool have_more_chiplet_cta(unsigned chiplet, unsigned mode);
+
+  dim3 get_chiplet_cta_dim3_batch(unsigned chiplet, unsigned batch_size);
+  dim3 get_chiplet_cta_dim3_row(unsigned chiplet, unsigned row_batch);
+  dim3 get_chiplet_cta_dim3_column(unsigned chiplet, unsigned column_batch);
 
  private:
   kernel_info_t *m_parent_kernel;
@@ -373,6 +454,8 @@ class core_config {
   }
   unsigned mem_warp_parts;
   mutable unsigned gpgpu_shmem_size;
+  char *gpgpu_shmem_option;
+  std::vector<unsigned> shmem_opt_list;
   unsigned gpgpu_shmem_sizeDefault;
   unsigned gpgpu_shmem_sizePrefL1;
   unsigned gpgpu_shmem_sizePrefShared;
@@ -446,11 +529,11 @@ class simt_stack {
 // in .ptx file)
 const unsigned long long GLOBAL_HEAP_START = 0xC0000000;
 // Volta max shmem size is 96kB
-const unsigned long long SHARED_MEM_SIZE_MAX = 96 * (1 << 10);
+const unsigned long long SHARED_MEM_SIZE_MAX = 1024 * (1 << 9);
 // Volta max local mem is 16kB
-const unsigned long long LOCAL_MEM_SIZE_MAX = 1 << 14;
-// Volta Titan V has 80 SMs
-const unsigned MAX_STREAMING_MULTIPROCESSORS = 80;
+const unsigned long long LOCAL_MEM_SIZE_MAX = 1 << 17;
+// 64 Sms per chiplet, 16 chiplets support
+const unsigned MAX_STREAMING_MULTIPROCESSORS = 1024;
 // Max 2048 threads / SM
 const unsigned MAX_THREAD_PER_SM = 1 << 11;
 // MAX 64 warps / SM
@@ -545,6 +628,9 @@ class gpgpu_functional_sim_config {
   unsigned m_texcache_linesize;
 };
 
+class Hub;
+class mmu;
+
 class gpgpu_t {
  public:
   gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx);
@@ -563,12 +649,17 @@ class gpgpu_t {
   unsigned long long gpu_sim_cycle;
   unsigned long long gpu_tot_sim_cycle;
 
+  Hub *m_gpu_alloc = nullptr;
+  mmu *m_mmu = nullptr;
+
+  void gpu_malloc_init();
   void *gpu_malloc(size_t size);
+  void gpu_free(void* address);
   void *gpu_mallocarray(size_t count);
-  void gpu_memset(size_t dst_start_addr, int c, size_t count);
-  void memcpy_to_gpu(size_t dst_start_addr, const void *src, size_t count);
-  void memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count);
-  void memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count);
+  void gpu_memset(size_t dst_start_addr, int c, size_t count, int appID);
+  void memcpy_to_gpu(size_t dst_start_addr, const void *src, size_t count, int appID = 1);
+  void memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count, int appID = 1);
+  void memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count, int appID = 1);
 
   class memory_space *get_global_memory() {
     return m_global_mem;
@@ -792,6 +883,10 @@ class mem_access_t {
     m_write = wr;
   }
 
+  void set_warp_mask(active_mask_t &mask) { m_warp_mask = mask; }
+  void set_byte_mask(mem_access_byte_mask_t &mask) { m_byte_mask = mask; }
+  void set_sector_mask(mem_access_sector_mask_t &mask) { m_sector_mask = mask; }
+
   new_addr_type get_addr() const { return m_addr; }
   void set_addr(new_addr_type addr) { m_addr = addr; }
   unsigned get_size() const { return m_req_size; }
@@ -865,10 +960,19 @@ class mem_fetch_allocator {
  public:
   virtual mem_fetch *alloc(new_addr_type addr, mem_access_type type,
                            unsigned size, bool wr,
-                           unsigned long long cycle) const = 0;
+                           unsigned long long cycle, unsigned sid,
+                           unsigned long long streamID) const = 0;
   virtual mem_fetch *alloc(const class warp_inst_t &inst,
                            const mem_access_t &access,
                            unsigned long long cycle) const = 0;
+  virtual mem_fetch *alloc(new_addr_type addr, mem_access_type type,
+                           const active_mask_t &active_mask,
+                           const mem_access_byte_mask_t &byte_mask,
+                           const mem_access_sector_mask_t &sector_mask,
+                           unsigned size, bool wr, unsigned long long cycle,
+                           unsigned wid, unsigned sid, unsigned tpc,
+                           mem_fetch *original_mf,
+                           unsigned long long streamID) const = 0;
 };
 
 // the maximum number of destination, source, or address uarch operands in a
@@ -902,6 +1006,7 @@ class inst_t {
     sp_op = OTHER_OP;
     op_pipe = UNKOWN_OP;
     mem_op = NOT_TEX;
+    const_cache_operand = 0;
     num_operands = 0;
     num_regs = 0;
     memset(out, 0, sizeof(unsigned));
@@ -920,7 +1025,7 @@ class inst_t {
   }
   bool valid() const { return m_decoded; }
   virtual void print_insn(FILE *fp) const {
-    fprintf(fp, " [inst @ pc=0x%04x] ", pc);
+    fprintf(fp, " [inst @ pc=0x%04llx] ", pc);
   }
   bool is_load() const {
     return (op == LOAD_OP || op == TENSOR_CORE_LOAD_OP ||
@@ -930,6 +1035,20 @@ class inst_t {
     return (op == STORE_OP || op == TENSOR_CORE_STORE_OP ||
             memory_op == memory_store);
   }
+
+  bool is_fp() const { return ((sp_op == FP__OP));}    //VIJAY
+  bool is_fpdiv() const { return ((sp_op == FP_DIV_OP));}
+  bool is_fpmul() const { return ((sp_op == FP_MUL_OP));}
+  bool is_dp() const { return ((sp_op == DP___OP));}
+  bool is_dpdiv() const { return ((sp_op == DP_DIV_OP));}
+  bool is_dpmul() const { return ((sp_op == DP_MUL_OP));}
+  bool is_imul() const { return ((sp_op == INT_MUL_OP));}
+  bool is_imul24() const { return ((sp_op == INT_MUL24_OP));}
+  bool is_imul32() const { return ((sp_op == INT_MUL32_OP));}
+  bool is_idiv() const { return ((sp_op == INT_DIV_OP));}
+  bool is_sfu() const {return ((sp_op == FP_SQRT_OP) || (sp_op == FP_LG_OP)  || (sp_op == FP_SIN_OP)  || (sp_op == FP_EXP_OP) || (sp_op == TENSOR__OP));}
+  bool is_alu() const {return (sp_op == INT__OP);}
+
   unsigned get_num_operands() const { return num_operands; }
   unsigned get_num_regs() const { return num_regs; }
   void set_num_regs(unsigned num) { num_regs = num; }
@@ -953,6 +1072,7 @@ class inst_t {
   operation_pipeline op_pipe;  // code (uarch visible) identify the pipeline of
                                // the operation (SP, SFU or MEM)
   mem_operation mem_op;        // code (uarch visible) identify memory type
+  bool const_cache_operand;   // has a load from constant memory as an operand
   _memory_op_t memory_op;      // memory_op used by ptxplus
   unsigned num_operands;
   unsigned num_regs;  // count vector operand as one register operand
@@ -996,11 +1116,19 @@ class warp_inst_t : public inst_t {
   // constructors
   warp_inst_t() {
     m_uid = 0;
+    m_streamID = (unsigned long long)-1;
     m_empty = true;
     m_config = NULL;
+
+    m_is_ldgsts = false;
+    m_is_ldgdepbar = false;
+    m_is_depbar = false;
+
+    m_depbar_group_no = 0;
   }
   warp_inst_t(const core_config *config) {
     m_uid = 0;
+    m_streamID = (unsigned long long)-1;
     assert(config->warp_size <= MAX_WARP_SIZE);
     m_config = config;
     m_empty = true;
@@ -1011,6 +1139,12 @@ class warp_inst_t : public inst_t {
     m_is_printf = false;
     m_is_cdp = 0;
     should_do_atomic = true;
+
+    m_is_ldgsts = false;
+    m_is_ldgdepbar = false;
+    m_is_depbar = false;
+
+    m_depbar_group_no = 0;
   }
   virtual ~warp_inst_t() {}
 
@@ -1021,7 +1155,8 @@ class warp_inst_t : public inst_t {
   void clear() { m_empty = true; }
 
   void issue(const active_mask_t &mask, unsigned warp_id,
-             unsigned long long cycle, int dynamic_warp_id, int sch_id);
+             unsigned long long cycle, int dynamic_warp_id, int sch_id,
+             unsigned long long streamID);
 
   const active_mask_t &get_active_mask() const { return m_warp_active_mask; }
   void completed(unsigned long long cycle)
@@ -1099,7 +1234,7 @@ class warp_inst_t : public inst_t {
 
   // accessors
   virtual void print_insn(FILE *fp) const {
-    fprintf(fp, " [inst @ pc=0x%04x] ", pc);
+    fprintf(fp, " [inst @ pc=0x%04llx] ", pc);
     for (int i = (int)m_config->warp_size - 1; i >= 0; i--)
       fprintf(fp, "%c", ((m_warp_active_mask[i]) ? '1' : '0'));
   }
@@ -1149,11 +1284,13 @@ class warp_inst_t : public inst_t {
 
   void print(FILE *fout) const;
   unsigned get_uid() const { return m_uid; }
+  unsigned long long get_streamID() const { return m_streamID; }
   unsigned get_schd_id() const { return m_scheduler_id; }
   active_mask_t get_warp_active_mask() const { return m_warp_active_mask; }
 
  protected:
   unsigned m_uid;
+  unsigned long long m_streamID;
   bool m_empty;
   bool m_cache_hit;
   unsigned long long issue_cycle;
@@ -1193,6 +1330,12 @@ class warp_inst_t : public inst_t {
   // Jin: cdp support
  public:
   int m_is_cdp;
+
+  bool m_is_ldgsts;
+  bool m_is_ldgdepbar;
+  bool m_is_depbar;
+
+  unsigned int m_depbar_group_no;
 };
 
 void move_warp(warp_inst_t *&dst, warp_inst_t *&src);
@@ -1291,6 +1434,7 @@ class register_set {
     }
     m_name = name;
   }
+  const char *get_name() { return m_name; }
   bool has_free() {
     for (unsigned i = 0; i < regs.size(); i++) {
       if (regs[i]->empty()) {
@@ -1315,7 +1459,35 @@ class register_set {
     }
     return false;
   }
+  bool has_ready(bool sub_core_model, unsigned reg_id) {
+    if (!sub_core_model) return has_ready();
+    assert(reg_id < regs.size());
+    return (not regs[reg_id]->empty());
+  }
 
+  unsigned get_ready_reg_id() {
+    // for sub core model we need to figure which reg_id has the ready warp
+    // this function should only be called if has_ready() was true
+    assert(has_ready());
+    warp_inst_t **ready;
+    ready = NULL;
+    unsigned reg_id = 0;
+    for (unsigned i = 0; i < regs.size(); i++) {
+      if (not regs[i]->empty()) {
+        if (ready and (*ready)->get_uid() < regs[i]->get_uid()) {
+          // ready is oldest
+        } else {
+          ready = &regs[i];
+          reg_id = i;
+        }
+      }
+    }
+    return reg_id;
+  }
+  unsigned get_schd_id(unsigned reg_id) {
+    assert(not regs[reg_id]->empty());
+    return regs[reg_id]->get_schd_id();
+  }
   void move_in(warp_inst_t *&src) {
     warp_inst_t **free = get_free();
     move_warp(*free, src);
@@ -1323,8 +1495,27 @@ class register_set {
   // void copy_in( warp_inst_t* src ){
   //   src->copy_contents_to(*get_free());
   //}
+  void move_in(bool sub_core_model, unsigned reg_id, warp_inst_t *&src) {
+    warp_inst_t **free;
+    if (!sub_core_model) {
+      free = get_free();
+    } else {
+      assert(reg_id < regs.size());
+      free = get_free(sub_core_model, reg_id);
+    }
+    move_warp(*free, src);
+  }
+
   void move_out_to(warp_inst_t *&dest) {
     warp_inst_t **ready = get_ready();
+    move_warp(dest, *ready);
+  }
+  void move_out_to(bool sub_core_model, unsigned reg_id, warp_inst_t *&dest) {
+    if (!sub_core_model) {
+      return move_out_to(dest);
+    }
+    warp_inst_t **ready = get_ready(sub_core_model, reg_id);
+    assert(ready != NULL);
     move_warp(dest, *ready);
   }
 
@@ -1340,6 +1531,14 @@ class register_set {
         }
       }
     }
+    return ready;
+  }
+  warp_inst_t **get_ready(bool sub_core_model, unsigned reg_id) {
+    if (!sub_core_model) return get_ready();
+    warp_inst_t **ready;
+    ready = NULL;
+    assert(reg_id < regs.size());
+    if (not regs[reg_id]->empty()) ready = &regs[reg_id];
     return ready;
   }
 
@@ -1382,6 +1581,6 @@ class register_set {
   const char *m_name;
 };
 
-#endif  // #ifdef __cplusplus
+//#endif  // #ifdef __cplusplus
 
 #endif  // #ifndef ABSTRACT_HARDWARE_MODEL_INCLUDED

@@ -1,3 +1,8 @@
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
 // Copyright (c) 2009-2011, Tor M. Aamodt, Wilson W.L. Fung, Ivan Sham,
 // Andrew Turner, Ali Bakhoda, The University of British Columbia
 // All rights reserved.
@@ -37,6 +42,7 @@
 #include "gpgpu-sim/icnt_wrapper.h"
 #include "option_parser.h"
 #include "stream_manager.h"
+#include "gpgpu-sim/memory_owner.h"
 
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
@@ -57,9 +63,13 @@ void *gpgpu_sim_thread_sequential(void *ctx_ptr) {
         ctx->the_gpgpusim->g_the_gpu->cycle();
         ctx->the_gpgpusim->g_the_gpu->deadlock_check();
       }
-      ctx->the_gpgpusim->g_the_gpu->print_stats();
+      ctx->the_gpgpusim->g_the_gpu->print_stats(ctx->the_gpgpusim->g_the_gpu->last_streamID);  // handle this line for stat print when kernel end
       ctx->the_gpgpusim->g_the_gpu->update_stats();
       ctx->print_simulation_time();
+
+      // reset cta scheduling, but not used because sequential execution is not used
+      ctx->the_gpgpusim->g_the_gpu->reset_cta_schedule();
+      ctx->the_gpgpusim->g_the_gpu->increase_sched_count();
     }
     sem_post(&(ctx->the_gpgpusim->g_sim_signal_finish));
   } while (!done);
@@ -83,8 +93,7 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
           "work ***\n");
       fflush(stdout);
     }
-    while (ctx->the_gpgpusim->g_stream_manager->empty_protected() &&
-           !ctx->the_gpgpusim->g_sim_done)
+    while (ctx->the_gpgpusim->g_stream_manager->empty() && !ctx->the_gpgpusim->g_sim_done)
       ;
     if (g_debug_execution >= 3) {
       printf("GPGPU-Sim: ** START simulation thread (detected work) **\n");
@@ -136,7 +145,7 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       }
 
       active = ctx->the_gpgpusim->g_the_gpu->active() ||
-               !(ctx->the_gpgpusim->g_stream_manager->empty_protected());
+               !(ctx->the_gpgpusim->g_stream_manager->empty());
 
     } while (active && !ctx->the_gpgpusim->g_sim_done);
     if (g_debug_execution >= 3) {
@@ -144,9 +153,13 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       fflush(stdout);
     }
     if (sim_cycles) {
-      ctx->the_gpgpusim->g_the_gpu->print_stats();
+      ctx->the_gpgpusim->g_the_gpu->print_stats(ctx->the_gpgpusim->g_the_gpu->last_streamID);
       ctx->the_gpgpusim->g_the_gpu->update_stats();
       ctx->print_simulation_time();
+
+      // reset cta scheduling
+      ctx->the_gpgpusim->g_the_gpu->reset_cta_schedule();
+      ctx->the_gpgpusim->g_the_gpu->increase_sched_count();
     }
     pthread_mutex_lock(&(ctx->the_gpgpusim->g_sim_lock));
     ctx->the_gpgpusim->g_sim_active = false;
@@ -155,7 +168,7 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
 
   printf("GPGPU-Sim: *** simulation thread exiting ***\n");
   fflush(stdout);
-
+  ctx->the_gpgpusim->g_the_gpu->print_stat_file(ctx->the_gpgpusim->g_the_gpu->last_streamID);  // TODO: need update for multi stream
   if (ctx->the_gpgpusim->break_limit) {
     printf(
         "GPGPU-Sim: ** break due to reaching the maximum cycles (or "
@@ -175,9 +188,7 @@ void gpgpu_context::synchronize() {
   bool done = false;
   do {
     pthread_mutex_lock(&(the_gpgpusim->g_sim_lock));
-    done = (the_gpgpusim->g_stream_manager->empty() &&
-            !the_gpgpusim->g_sim_active) ||
-           the_gpgpusim->g_sim_done;
+    done = (the_gpgpusim->g_stream_manager->empty()) || the_gpgpusim->g_sim_done;
     pthread_mutex_unlock(&(the_gpgpusim->g_sim_lock));
   } while (!done);
   printf("GPGPU-Sim: detected inactive GPU simulation thread\n");
@@ -218,10 +229,22 @@ gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
   assert(setlocale(LC_NUMERIC, "C"));
   the_gpgpusim->g_the_gpu_config->init();
 
+  /**********************************************************************/
+  printf("Initialing GPGPU MMU. Called by gpgpu-sim entrypoint\n");
+  if(the_gpgpusim->g_mmu == nullptr){
+      the_gpgpusim->g_mmu = new mmu();
+      the_gpgpusim->g_mmu->init(the_gpgpusim->g_the_gpu_config->get_mem_config());
+  }
+  printf("In gpgpu-sim entrypoint, done initialing GPGPU MMU, setting mmu in the gpu-sim-config\n");
+  the_gpgpusim->g_the_gpu_config->set_mmu(the_gpgpusim->g_mmu);
+  /**********************************************************************/
+
   the_gpgpusim->g_the_gpu =
       new exec_gpgpu_sim(*(the_gpgpusim->g_the_gpu_config), this);
+  printf("In gpgpu-sim entrypoint, done initializing gpgpu-sim\n");
   the_gpgpusim->g_stream_manager = new stream_manager(
       (the_gpgpusim->g_the_gpu), func_sim->g_cuda_launch_blocking);
+  printf("In gpgpu-sim entrypoint, done initializing gpgpu-sim stream manager\n");
 
   the_gpgpusim->g_simulation_starttime = time((time_t *)NULL);
 

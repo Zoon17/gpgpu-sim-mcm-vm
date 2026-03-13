@@ -30,13 +30,16 @@
 #include <stdlib.h>
 #include "../../libcuda/gpgpu_context.h"
 #include "../debug.h"
+#include "../gpgpu-sim/memory_owner.h"
+#include "ptx_ir.h"
+
+#define APP_ID 1
 
 template <unsigned BSIZE>
 memory_space_impl<BSIZE>::memory_space_impl(std::string name,
                                             unsigned hash_size) {
   m_name = name;
   MEM_MAP_RESIZE(hash_size);
-
   m_log2_block_size = -1;
   for (unsigned n = 0, mask = 1; mask != 0; mask <<= 1, n++) {
     if (BSIZE & mask) {
@@ -49,7 +52,7 @@ memory_space_impl<BSIZE>::memory_space_impl(std::string name,
 
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::write_only(mem_addr_t offset, mem_addr_t index,
-                                          size_t length, const void *data) {
+                                          size_t length, const void *data, int appID) {
   m_data[index].write(offset, length, (const unsigned char *)data);
 }
 
@@ -57,7 +60,7 @@ template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
                                      const void *data,
                                      class ptx_thread_info *thd,
-                                     const ptx_instruction *pI) {
+                                     const ptx_instruction *pI, int appID) {
   mem_addr_t index = addr >> m_log2_block_size;
 
   if ((addr + length) <= (index + 1) * BSIZE) {
@@ -105,15 +108,15 @@ void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::read_single_block(mem_addr_t blk_idx,
                                                  mem_addr_t addr, size_t length,
-                                                 void *data) const {
+                                                 void *data, int appID) const {
   if ((addr + length) > (blk_idx + 1) * BSIZE) {
     printf(
         "GPGPU-Sim PTX: ERROR * access to memory \'%s\' is unaligned : "
-        "addr=0x%x, length=%zu\n",
+        "addr=0x%llx, length=%zu\n",
         m_name.c_str(), addr, length);
     printf(
-        "GPGPU-Sim PTX: (addr+length)=0x%lx > 0x%x=(index+1)*BSIZE, "
-        "index=0x%x, BSIZE=0x%x\n",
+        "GPGPU-Sim PTX: (addr+length)=0x%llx > 0x%llx=(index+1)*BSIZE, "
+        "index=0x%llx, BSIZE=0x%x\n",
         (addr + length), (blk_idx + 1) * BSIZE, blk_idx, BSIZE);
     throw 1;
   }
@@ -132,11 +135,11 @@ void memory_space_impl<BSIZE>::read_single_block(mem_addr_t blk_idx,
 
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::read(mem_addr_t addr, size_t length,
-                                    void *data) const {
+                                    void *data, int appID) const {
   mem_addr_t index = addr >> m_log2_block_size;
   if ((addr + length) <= (index + 1) * BSIZE) {
     // fast route for intra-block access
-    read_single_block(index, addr, length, data);
+    read_single_block(index, addr, length, data, appID);
   } else {
     // slow route for inter-block access
     unsigned nbytes_remain = length;
@@ -153,7 +156,7 @@ void memory_space_impl<BSIZE>::read(mem_addr_t addr, size_t length,
 
       size_t tx_bytes = access_limit - offset;
       read_single_block(page, current_addr, tx_bytes,
-                        &((unsigned char *)data)[dst_offset]);
+                        &((unsigned char *)data)[dst_offset], appID);
 
       // advance pointers
       dst_offset += tx_bytes;
@@ -169,7 +172,7 @@ void memory_space_impl<BSIZE>::print(const char *format, FILE *fout) const {
   typename map_t::const_iterator i_page;
 
   for (i_page = m_data.begin(); i_page != m_data.end(); ++i_page) {
-    fprintf(fout, "%s %08x:", m_name.c_str(), i_page->first);
+    fprintf(fout, "%s %08llx:", m_name.c_str(), i_page->first);
     i_page->second.print(format, fout);
   }
 }
@@ -200,7 +203,7 @@ int main(int argc, char *argv[]) {
 
   for (mem_addr_t addr = 0; addr < 16 * 1024; addr += 4) {
     unsigned tmp = 0;
-    mem->read(addr, 4, &tmp);
+    mem->read(addr, 4, &tmp, APP_ID);
     if (tmp != addr) {
       errors_found = 1;
       printf("ERROR ** mem[0x%x] = 0x%x, expected 0x%x\n", addr, tmp, addr);
@@ -214,7 +217,7 @@ int main(int argc, char *argv[]) {
 
   for (mem_addr_t addr = 0; addr < 16 * 1024; addr += 1) {
     unsigned tmp = 0;
-    mem->read(addr, 1, &tmp);
+    mem->read(addr, 1, &tmp, APP_ID);
     unsigned char val = (addr + 128) % 256;
     if (tmp != val) {
       errors_found = 1;

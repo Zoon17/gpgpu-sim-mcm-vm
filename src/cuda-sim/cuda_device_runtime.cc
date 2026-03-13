@@ -17,6 +17,8 @@
 #include "cuda_device_runtime.h"
 #include "ptx_ir.h"
 
+#define APP_ID 1
+
 #define DEV_RUNTIME_REPORT(a)                                       \
   if (g_debug_execution) {                                          \
     std::cout << __FILE__ << ", " << __LINE__ << ": " << a << "\n"; \
@@ -36,7 +38,7 @@ void cuda_device_runtime::gpgpusim_cuda_getParameterBufferV2(
   unsigned n_args = target_func->num_args();
   assert(n_args == 4);
 
-  function_info *child_kernel_entry;
+  function_info *child_kernel_entry = NULL;
   struct dim3 grid_dim, block_dim;
   unsigned int shared_mem;
 
@@ -53,24 +55,24 @@ void cuda_device_runtime::gpgpusim_cuda_getParameterBufferV2(
     if (arg == 0) {  // function_info* for the child kernel
       unsigned long long buf;
       assert(size == sizeof(function_info *));
-      thread->m_local_mem->read(from_addr, size, &buf);
+      thread->m_local_mem->read(from_addr, size, &buf, APP_ID);
       child_kernel_entry = (function_info *)buf;
       assert(child_kernel_entry);
       DEV_RUNTIME_REPORT("child kernel name "
                          << child_kernel_entry->get_name());
     } else if (arg == 1) {  // dim3 grid_dim for the child kernel
       assert(size == sizeof(struct dim3));
-      thread->m_local_mem->read(from_addr, size, &grid_dim);
+      thread->m_local_mem->read(from_addr, size, &grid_dim, APP_ID);
       DEV_RUNTIME_REPORT("grid (" << grid_dim.x << ", " << grid_dim.y << ", "
                                   << grid_dim.z << ")");
     } else if (arg == 2) {  // dim3 block_dim for the child kernel
       assert(size == sizeof(struct dim3));
-      thread->m_local_mem->read(from_addr, size, &block_dim);
+      thread->m_local_mem->read(from_addr, size, &block_dim, APP_ID);
       DEV_RUNTIME_REPORT("block (" << block_dim.x << ", " << block_dim.y << ", "
                                    << block_dim.z << ")");
     } else if (arg == 3) {  // unsigned int shared_mem
       assert(size == sizeof(unsigned int));
-      thread->m_local_mem->read(from_addr, size, &shared_mem);
+      thread->m_local_mem->read(from_addr, size, &shared_mem, APP_ID);
       DEV_RUNTIME_REPORT("shared memory " << shared_mem);
     }
   }
@@ -103,7 +105,7 @@ void cuda_device_runtime::gpgpusim_cuda_getParameterBufferV2(
          return_size == sizeof(void *));
   addr_t ret_param_addr = actual_return_op.get_symbol()->get_address();
   thread->m_local_mem->write(ret_param_addr, return_size, &param_buffer, NULL,
-                             NULL);
+                             NULL, APP_ID);
 }
 
 // Handling device runtime api:
@@ -138,7 +140,7 @@ void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
     if (arg == 0) {  // paramter buffer for child kernel (in global memory)
       // get parameter_buffer from the cudaLaunchDeviceV2_param0
       assert(size == sizeof(void *));
-      thread->m_local_mem->read(from_addr, size, &parameter_buffer);
+      thread->m_local_mem->read(from_addr, size, &parameter_buffer, APP_ID);
       assert((size_t)parameter_buffer >= GLOBAL_HEAP_START);
       DEV_RUNTIME_REPORT("Parameter buffer locating at global memory "
                          << parameter_buffer);
@@ -198,14 +200,14 @@ void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
       for (unsigned n = 0; n < device_kernel_arg_size; n += 4) {
         unsigned int oneword;
         thread->get_gpu()->get_global_memory()->read(
-            (size_t)parameter_buffer + n, 4, &oneword);
+            (size_t)parameter_buffer + n, 4, &oneword, APP_ID);
         device_kernel_param_mem->write(param_start_address + n, 4, &oneword,
-                                       NULL, NULL);
+                                       NULL, NULL, APP_ID);
       }
     } else if (arg == 1) {  // cudaStream for the child kernel
 
       assert(size == sizeof(cudaStream_t));
-      thread->m_local_mem->read(from_addr, size, &child_stream);
+      thread->m_local_mem->read(from_addr, size, &child_stream, APP_ID);
 
       kernel_info_t &parent_kernel = thread->get_kernel();
       if (child_stream == 0) {  // default stream on device for current CTA
@@ -241,7 +243,7 @@ void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
          return_size == sizeof(cudaError_t));
   cudaError_t error = cudaSuccess;
   addr_t ret_param_addr = actual_return_op.get_symbol()->get_address();
-  thread->m_local_mem->write(ret_param_addr, return_size, &error, NULL, NULL);
+  thread->m_local_mem->write(ret_param_addr, return_size, &error, NULL, NULL, APP_ID);
 }
 
 // Handling device runtime api:
@@ -258,7 +260,7 @@ void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
   assert(n_args == 2);
 
   size_t generic_pStream_addr;
-  addr_t pStream_addr;
+  addr_t pStream_addr = 0;
   unsigned int flags;
   for (unsigned arg = 0; arg < n_args; arg++) {
     const operand_info &actual_param_op =
@@ -272,7 +274,7 @@ void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
 
     if (arg == 0) {  // cudaStream_t * pStream, address of cudaStream_t
       assert(size == sizeof(cudaStream_t *));
-      thread->m_local_mem->read(from_addr, size, &generic_pStream_addr);
+      thread->m_local_mem->read(from_addr, size, &generic_pStream_addr, APP_ID);
 
       // pStream should be non-zero address in local memory
       pStream_addr = generic_to_local(
@@ -282,7 +284,7 @@ void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
     } else if (arg ==
                1) {  // unsigned int flags, should be cudaStreamNonBlocking
       assert(size == sizeof(unsigned int));
-      thread->m_local_mem->read(from_addr, size, &flags);
+      thread->m_local_mem->read(from_addr, size, &flags, APP_ID);
       assert(flags == cudaStreamNonBlocking);
     }
   }
@@ -292,7 +294,7 @@ void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
       thread->get_kernel().create_stream_cta(thread->get_ctaid());
   DEV_RUNTIME_REPORT("Create stream " << stream->get_uid() << ": " << stream);
   thread->m_local_mem->write(pStream_addr, sizeof(cudaStream_t), &stream, NULL,
-                             NULL);
+                             NULL, APP_ID);
 
   // set retval0
   const operand_info &actual_return_op = pI->operand_lookup(0);  // retval0
@@ -305,7 +307,7 @@ void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
          return_size == sizeof(cudaError_t));
   cudaError_t error = cudaSuccess;
   addr_t ret_param_addr = actual_return_op.get_symbol()->get_address();
-  thread->m_local_mem->write(ret_param_addr, return_size, &error, NULL, NULL);
+  thread->m_local_mem->write(ret_param_addr, return_size, &error, NULL, NULL, APP_ID);
 }
 
 void cuda_device_runtime::launch_one_device_kernel() {

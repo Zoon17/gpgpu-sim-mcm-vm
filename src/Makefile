@@ -55,7 +55,8 @@ CXXFLAGS += -I$(CUDA_INSTALL_PATH)/include
 
 OPTFLAGS += -g3 -fPIC
 
-CPP = g++ $(SNOW)
+CXX ?= g++
+CPP = $(CXX) $(SNOW)
 OEXT = o
 
 OUTPUT_DIR=$(SIM_OBJ_FILES_DIR)

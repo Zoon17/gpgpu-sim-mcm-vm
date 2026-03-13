@@ -1,18 +1,25 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt
-// The University of British Columbia
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
+// Copyright (c) 2009-2021, Tor M. Aamodt, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -35,6 +42,11 @@
 #include <list>
 #include <queue>
 
+
+#include "gpu-cache.h"
+
+class mmu;
+class dram_cmd;
 class mem_fetch;
 
 class partition_mf_allocator : public mem_fetch_allocator {
@@ -50,7 +62,15 @@ class partition_mf_allocator : public mem_fetch_allocator {
   }
   virtual mem_fetch *alloc(new_addr_type addr, mem_access_type type,
                            unsigned size, bool wr,
-                           unsigned long long cycle) const;
+                           unsigned long long cycle, unsigned sid, unsigned long long streamID) const;
+  virtual mem_fetch *alloc(new_addr_type addr, mem_access_type type,
+                           const active_mask_t &active_mask,
+                           const mem_access_byte_mask_t &byte_mask,
+                           const mem_access_sector_mask_t &sector_mask,
+                           unsigned size, bool wr, unsigned long long cycle,
+                           unsigned wid, unsigned sid, unsigned tpc,
+                           mem_fetch *original_mf,
+                           unsigned long long streamID) const;
 
  private:
   const memory_config *m_memory_config;
@@ -63,10 +83,24 @@ class partition_mf_allocator : public mem_fetch_allocator {
 class memory_partition_unit {
  public:
   memory_partition_unit(unsigned partition_id, const memory_config *config,
-                        class memory_stats_t *stats, class gpgpu_sim *gpu);
+                        class memory_stats_t *stats, class gpgpu_sim *gpu,
+                        mmu * page_manager, tlb_tag_array * shared_tlb);
   ~memory_partition_unit();
 
+  void set_dram(unsigned partition_id);
+
   bool busy() const;
+
+  unsigned m_chiplet;
+  void set_chiplet(unsigned chiplet) { m_chiplet = chiplet; }
+  unsigned get_chiplet() const { return m_chiplet; }
+
+  inter_noc * m_inter_noc;
+  void set_inter_noc(inter_noc * inter_noc) { m_inter_noc = inter_noc; }
+  inter_noc * get_inter_noc() { return m_inter_noc; }
+
+  tlb_tag_array * m_shared_tlb;
+  mmu * m_page_manager;
 
   void cache_cycle(unsigned cycle);
   void dram_cycle();
@@ -80,6 +114,7 @@ class memory_partition_unit {
   void print(FILE *fp) const;
   void handle_memcpy_to_gpu(size_t dst_start_addr, unsigned subpart_id,
                             mem_access_sector_mask_t mask);
+  void insert_dram_command(dram_cmd * cmd);  // not used
 
   class memory_sub_partition *get_sub_partition(int sub_partition_id) {
     return m_sub_partition[sub_partition_id];
@@ -88,7 +123,7 @@ class memory_partition_unit {
   // Power model
   void set_dram_power_stats(unsigned &n_cmd, unsigned &n_activity,
                             unsigned &n_nop, unsigned &n_act, unsigned &n_pre,
-                            unsigned &n_rd, unsigned &n_wr,
+                            unsigned &n_rd, unsigned &n_wr, unsigned &n_wr_WB,
                             unsigned &n_req) const;
 
   int global_sub_partition_id_to_local_id(int global_sub_partition_id) const;
@@ -150,6 +185,23 @@ class memory_partition_unit {
 
 class memory_sub_partition {
  public:
+  void flush(new_addr_type vpn_64);
+
+  unsigned m_chiplet;
+  void set_chiplet(unsigned chiplet) {
+    m_chiplet = chiplet;
+    m_L2cache->set_chiplet(chiplet);
+    m_L2cache->set_sub_partition(this);
+  }
+  unsigned get_chiplet() const { return m_chiplet; }
+
+  inter_noc * m_inter_noc;
+  void set_inter_noc(inter_noc * inter_noc) {
+      m_inter_noc = inter_noc;
+      m_L2cache->set_inter_noc(inter_noc);
+  }
+  inter_noc * get_inter_noc() { return m_inter_noc; }
+
   memory_sub_partition(unsigned sub_partition_id, const memory_config *config,
                        class memory_stats_t *stats, class gpgpu_sim *gpu);
   ~memory_sub_partition();
@@ -168,6 +220,11 @@ class memory_sub_partition {
   void set_done(mem_fetch *mf);
 
   unsigned flushL2();
+  void flushL2(unsigned appid)
+  {
+      abort();  // not used
+      //m_L2cache->flush(appid);  // not used
+  }
   unsigned invalidateL2();
 
   // interface to L2_dram_queue
@@ -196,11 +253,15 @@ class memory_sub_partition {
     m_memcpy_cycle_offset += 1;
   }
 
+  bool handle_remote_access(mem_fetch * mf);
+  bool handle_remote_response(mem_fetch * mf);
+
  private:
   // data
   unsigned m_id;  //< the global sub partition ID
   const memory_config *m_config;
   class l2_cache *m_L2cache;
+  class dram_t *m_dram;
   class L2interface *m_L2interface;
   class gpgpu_sim *m_gpu;
   partition_mf_allocator *m_mf_allocator;
@@ -217,6 +278,16 @@ class memory_sub_partition {
   fifo_pipeline<mem_fetch> *m_L2_dram_queue;
   fifo_pipeline<mem_fetch> *m_dram_L2_queue;
   fifo_pipeline<mem_fetch> *m_L2_icnt_queue;  // L2 cache hit response queue
+
+  std::deque<mem_fetch *> * m_remote_access_queue;
+  std::deque<mem_fetch *> * m_remote_return_queue;
+
+  bool m_access_rr = false;
+  bool m_return_rr = false;
+
+  /* fifo_pipeline<mem_fetch> *m_L2_dram_queue_fl; */
+  std::queue<mem_fetch*> *m_L2_dram_queue_fl;
+  fifo_pipeline<mem_fetch> *m_dram_L2_queue_fl;
 
   class mem_fetch *L2dramout;
   unsigned long long int wb_addr;

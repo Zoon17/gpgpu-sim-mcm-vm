@@ -1,19 +1,26 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Wilson W.L. Fung, George L. Yuan,
-// Ali Bakhoda, Andrew Turner, Ivan Sham
-// The University of British Columbia
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
+// Copyright (c) 2009-2021, Tor M. Aamodt, Wilson W.L. Fung, George L. Yuan,
+// Ali Bakhoda, Andrew Turner, Ivan Sham, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -57,13 +64,11 @@
 #include "../cuda-sim/cuda_device_runtime.h"
 #include "../cuda-sim/ptx-stats.h"
 #include "../cuda-sim/ptx_ir.h"
-#include "../debug.h"
 #include "../gpgpusim_entrypoint.h"
 #include "../statwrapper.h"
 #include "../trace.h"
 #include "mem_latency_stat.h"
 #include "power_stat.h"
-#include "stats.h"
 #include "visualizer.h"
 
 #ifdef GPGPUSIM_POWER_MODEL
@@ -78,7 +83,7 @@ class gpgpu_sim_wrapper {};
 #include <sstream>
 #include <string>
 
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+//#define MAX(a, b) (((a) > (b)) ? (a) : (b))  // redefined
 
 bool g_interactive_debugger_enabled = false;
 
@@ -95,10 +100,11 @@ tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
 
 #include "mem_latency_stat.h"
 
+
 void power_config::reg_options(class OptionParser *opp) {
-  option_parser_register(opp, "-gpuwattch_xml_file", OPT_CSTR,
-                         &g_power_config_name, "GPUWattch XML file",
-                         "gpuwattch.xml");
+  option_parser_register(opp, "-accelwattch_xml_file", OPT_CSTR,
+                         &g_power_config_name, "AccelWattch XML file",
+                         "accelwattch_sass_sim.xml");
 
   option_parser_register(opp, "-power_simulation_enabled", OPT_BOOL,
                          &g_power_simulation_enabled,
@@ -107,6 +113,89 @@ void power_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-power_per_cycle_dump", OPT_BOOL,
                          &g_power_per_cycle_dump,
                          "Dump detailed power output each cycle", "0");
+
+  option_parser_register(opp, "-hw_perf_file_name", OPT_CSTR,
+                         &g_hw_perf_file_name, "Hardware Performance Statistics file",
+                         "hw_perf.csv");
+
+  option_parser_register(opp, "-hw_perf_bench_name", OPT_CSTR,
+                         &g_hw_perf_bench_name, "Kernel Name in Hardware Performance Statistics file",
+                         "");
+
+  option_parser_register(opp, "-power_simulation_mode", OPT_INT32,
+                         &g_power_simulation_mode,
+                         "Switch performance counter input for power simulation (0=Sim, 1=HW, 2=HW-Sim Hybrid)", "0");
+
+  option_parser_register(opp, "-dvfs_enabled", OPT_BOOL,
+                         &g_dvfs_enabled,
+                         "Turn on DVFS for power model", "0");
+  option_parser_register(opp, "-aggregate_power_stats", OPT_BOOL,
+                         &g_aggregate_power_stats,
+                         "Accumulate power across all kernels", "0");
+
+  //Accelwattch Hyrbid Configuration
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L1_RH", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L1_RH],
+                         "Get L1 Read Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L1_RM", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L1_RM],
+                         "Get L1 Read Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L1_WH", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L1_WH],
+                         "Get L1 Write Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L1_WM", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L1_WM],
+                         "Get L1 Write Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L2_RH", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L2_RH],
+                         "Get L2 Read Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L2_RM", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L2_RM],
+                         "Get L2 Read Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L2_WH", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L2_WH],
+                         "Get L2 Write Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_L2_WM", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_L2_WM],
+                         "Get L2 Write Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_CC_ACC", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_CC_ACC],
+                         "Get Constant Cache Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_SHARED_ACC", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_SHRD_ACC],
+                         "Get Shared Memory Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_DRAM_RD", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_DRAM_RD],
+                         "Get DRAM Reads for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_DRAM_WR", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_DRAM_WR],
+                         "Get DRAM Writes for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_NOC", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_NOC],
+                         "Get Interconnect Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_PIPE_DUTY", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_PIPE_DUTY],
+                         "Get Pipeline Duty Cycle Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_NUM_SM_IDLE", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_NUM_SM_IDLE],
+                         "Get Number of Idle SMs for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_CYCLES", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_CYCLES],
+                         "Get Executed Cycles for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_VOLTAGE", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_VOLTAGE],
+                         "Get Chip Voltage for Accelwattch-Hybrid from Accel-Sim", "0");
+
 
   // Output Data Formats
   option_parser_register(
@@ -131,12 +220,12 @@ void power_config::reg_options(class OptionParser *opp) {
 void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-gpgpu_perf_sim_memcpy", OPT_BOOL,
                          &m_perf_sim_memcpy, "Fill the L2 cache on memcpy",
-                         "1");
+                         "0");
   option_parser_register(opp, "-gpgpu_simple_dram_model", OPT_BOOL,
                          &simple_dram_model,
                          "simple_dram_model with fixed latency and BW", "0");
   option_parser_register(opp, "-gpgpu_dram_scheduler", OPT_INT32,
-                         &scheduler_type, "0 = fifo, 1 = FR-FCFS (defaul)",
+                         &scheduler_type, "0 = fifo, 1 = FR-FCFS (default)",
                          "1");
   option_parser_register(opp, "-gpgpu_dram_partition_queues", OPT_CSTR,
                          &gpgpu_L2_queue_config, "i2$:$2d:d2$:$2i", "8:8:8:8");
@@ -215,6 +304,147 @@ void memory_config::reg_options(class OptionParser *opp) {
       "elimnate_rw_turnaround i.e set tWTR and tRTW = 0", "0");
   option_parser_register(opp, "-icnt_flit_size", OPT_UINT32, &icnt_flit_size,
                          "icnt_flit_size", "32");
+
+  /********************************************************************************************************************/
+  option_parser_register(opp, "-page_size_list", OPT_CSTR, &page_size_list,
+                         "List of differing page sizes (in bytes) (default = 2MB and 4KB page sizes)"
+                              "junhyeok: fixed value, please do not change this"
+                              "Current memory mapping policy is customized to support diverse page size using this value"
+                              "Actual page size is determined by the -set_page_size config", "4096:4096");
+  option_parser_register(opp, "-pages_in_chunk", OPT_UINT32, &pages_in_chunk,
+                         "Number of 4KB base pages in allocation chunk"
+                         "junhyeok: fixed value, please do not change this"
+                         "Current memory mapping policy is customized to support diverse page size using this value"
+                         "Actual page size is determined by the -set_page_size config", "1");
+  option_parser_register(opp, "-DRAM_size", OPT_UINT64, &DRAM_size,
+                         "Size of the DRAM", "17179869184");
+
+  option_parser_register(opp, "-vm_config", OPT_UINT32, &vm_config,
+                         "Which Virtual Memory Configuration to Run: default = baseline", "0");
+  option_parser_register(opp, "-va_mask", OPT_CSTR, &va_mask,
+                         "Mask of the virtual address for PT walk routine (should match with tlb_levels)",
+                         "444444444333333333222222222111111111000000000000");
+
+  option_parser_register(opp, "-l1_tlb_port", OPT_UINT32,&l1_tlb_port,
+                       "L1 TLB port", "4");
+  option_parser_register(opp, "-tlb_size", OPT_UINT32, &tlb_size,
+                         "Size of TLB per SM", "32");
+  option_parser_register(opp, "-l1_tlb_latency", OPT_UINT32,&l1_tlb_latency,
+                         "L1 TLB Latancy", "20");
+  option_parser_register(opp, "-L1_TLB_MSHR_entry", OPT_UINT32,&L1_TLB_MSHR_entry,
+                         "number of L1 TLB MSHR entry", "32");
+  option_parser_register(opp, "-L1_TLB_MSHR_merge", OPT_UINT32,&L1_TLB_MSHR_merge,
+                         "number of L1 TLB MSHR merge", "16");
+
+  option_parser_register(opp, "-l2_tlb_ports", OPT_INT32, &l2_tlb_ports,
+                         "Level 2 TLB ports", "8");
+  option_parser_register(opp, "-l2_tlb_latency", OPT_INT32, &l2_tlb_latency,
+                         "Level 2 TLB latency", "40");
+  option_parser_register(opp, "-l2_tlb_ways", OPT_UINT32, &l2_tlb_ways,
+                         "L2 TLB ways", "16");
+  option_parser_register(opp, "-l2_tlb_entries", OPT_UINT32, &l2_tlb_entries,
+                         "L2 TLB entires", "1024");
+  option_parser_register(opp, "-L2_TLB_MSHR_entry", OPT_UINT32, &L2_TLB_MSHR_entry,
+                         "number of L2 TLB MSHR entry", "128");
+  option_parser_register(opp, "-L2_TLB_MSHR_merge", OPT_UINT32, &L2_TLB_MSHR_merge,
+                         "number of L2 TLB MSHR merge", "24");
+
+  option_parser_register(opp, "-num_page_walkers", OPT_UINT32,
+                         &num_page_walkers,
+                         "max number of page walks that can be in flight at a time", "16");
+  option_parser_register(opp, "-page_walk_queue_depth", OPT_UINT32,
+                         &page_walk_queue_depth,
+                         "Size of the Page Walk Queue", "128");
+
+  option_parser_register(opp, "-pw_cache_latency", OPT_UINT32, &pw_cache_latency,
+                         "PW cache latency", "10");
+  option_parser_register(opp, "-pw_cache_num_ports", OPT_UINT32, &pw_cache_num_ports,
+                         "Number of ports for the PW cache", "4");
+  option_parser_register(opp, "-tlb_pw_cache_entries", OPT_UINT32, &tlb_pw_cache_entries,
+                         "Number of PW cache entries", "64");
+  option_parser_register(opp, "-tlb_pw_cache_ways", OPT_UINT32, &tlb_pw_cache_ways,
+                         "Number of PW cache ways", "8");
+
+  option_parser_register(opp, "-set_page_size", OPT_UINT32, &set_page_size,
+                         "Set page size for GPU memory mapping", "1");
+  option_parser_register(opp, "-enable_walk_fault", OPT_BOOL, &enable_walk_fault,
+                         "Page fault trigger at page table walk process", "0");
+  option_parser_register(opp, "-enable_pte_rr", OPT_BOOL, &enable_pte_rr,
+                         "Enable PTE page allocation (round-robin based)", "0");
+
+  option_parser_register(opp, "-dram_stat_enable", OPT_BOOL,&dram_stat_enable,
+                         "DRAM detail stat enable option", "0");
+
+  option_parser_register(opp, "-chiplet_num", OPT_UINT32, &chiplet_num,
+                         "Chiplet number", "4");
+  option_parser_register(opp, "-total_sm_num", OPT_UINT32, &total_sm_num,
+                         "Total SM core numbers", "64");
+  option_parser_register(opp, "-mcm_cta_schedule", OPT_UINT32, &mcm_cta_schedule,
+                         "CTA scheduling policy in MCM GPU"
+                         "0 : Centralized Round Robin scheduling (baseline)"
+                         "1 : Distributed scheduling ", "0");
+  option_parser_register(opp, "-mcm_data_schedule", OPT_UINT32, &mcm_data_schedule,
+                         "Page allocation policy in MCM GPU (not supported option, updated later)"
+                         "0 : Centralized Round Robin Page Mapping"
+                         "1 : First-Touch Page Mapping ", "1");
+
+  option_parser_register(opp, "-link_latency", OPT_UINT64, &link_latency,
+                         "Inter-chip interconnect latency", "32");
+  option_parser_register(opp, "-link_bandwidth", OPT_UINT32, &link_bandwidth,
+                         "Inter-chip interconnect bandwidth (GBps)", "192");
+  option_parser_register(opp, "-link_frequency", OPT_UINT32, &link_frequency,
+                         "Inter-chip interconnect frequency (GHz)", "1");
+  option_parser_register(opp, "-link_tx_depth", OPT_UINT32, &link_tx_depth,
+                         "Inter-chip link tx_queue depth", "128");
+  option_parser_register(opp, "-link_arrive_depth", OPT_UINT32, &link_arrive_depth,
+                       "Inter-chip link arrive_queue depth", "128");
+
+  option_parser_register(opp, "-noc_gateway_depth", OPT_UINT32, &noc_gateway_depth,
+                       "Inter-chip noc gateway_queue depth", "128");
+  option_parser_register(opp, "-noc_push_depth", OPT_UINT32, &noc_push_depth,
+                      "Inter-chip noc push_queue depth", "129");
+  option_parser_register(opp, "-noc_receive_depth", OPT_UINT32, &noc_receive_depth,
+                      "Inter-chip noc receive_queue depth", "128");
+
+  option_parser_register(opp, "-data_type_byte", OPT_UINT32, &data_type_byte,
+                         "Input data - data type byte size", "4");
+  option_parser_register(opp, "-data_batch", OPT_UINT32, &data_batch,
+                         "Static data placement - data scheduling size", "0");
+
+  option_parser_register(opp, "-cta_batch", OPT_UINT32, &cta_batch,
+                         "Static CTA scheduling - batch size", "0");
+
+  option_parser_register(opp, "-static_cta_multi_enable", OPT_BOOL, &static_cta_multi_enable,
+                         "Static-based policy - CTA multiple policy", "0");
+  option_parser_register(opp, "-static_data_multi_enable", OPT_BOOL, &static_data_multi_enable,
+                         "Static-based policy - data multiple policy", "0");
+
+  option_parser_register(opp, "-cta_sched_list", OPT_CSTR, &cta_sched_list,
+                         "CTA scheduling policy list", "1:1");
+  option_parser_register(opp, "-cta_batch_list", OPT_CSTR, &cta_batch_list,
+                         "CTA batch size list", "0:0");
+
+  option_parser_register(opp, "-data_sched_list", OPT_CSTR, &data_sched_list,
+                         "Data scheduling policy list", "1:1");
+  option_parser_register(opp, "-data_batch_list", OPT_CSTR, &data_batch_list,
+                         "Data batch size list", "0:0");
+
+  option_parser_register(opp, "-trigger_balancing", OPT_FLOAT, &trigger_balancing,
+                       "Trigger balanced page mapping", "0.2");
+  option_parser_register(opp, "-remote_thres", OPT_FLOAT, &remote_thres,
+                     "Balanced page mapping threshold for remote access ratio", "0.50");
+  option_parser_register(opp, "-balanching_thres", OPT_FLOAT, &balancing_thres,
+                         "Balanced page mapping threshold", "0.9");
+
+  option_parser_register(opp, "-mem_config", OPT_UINT32, &mem_config,
+                         "Memory system config", "0");
+  option_parser_register(opp, "-enable_mem_side", OPT_BOOL, &enable_mem_side,
+                         "Enable memory-side cache", "0");
+  option_parser_register(opp, "-enable_remote_debug", OPT_BOOL, &enable_remote_debug,
+                         "Enable remote memory access debug", "0");
+
+
+  /********************************************************************************************************************/
   m_address_mapping.addrdec_setoption(opp);
 }
 
@@ -249,6 +479,8 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
                          "alloc>,<mshr>:<N>:<merge>,<mq> | none}",
                          "none");
+  option_parser_register(opp, "-gpgpu_l1_cache_write_ratio", OPT_UINT32,
+                         &m_L1D_config.m_wr_percent, "L1D write ratio", "0");
   option_parser_register(opp, "-gpgpu_l1_banks", OPT_UINT32,
                          &m_L1D_config.l1_banks, "The number of L1 cache banks",
                          "1");
@@ -304,7 +536,7 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "gpgpu_ignore_resources_limitation (default 0)", "0");
   option_parser_register(
       opp, "-gpgpu_shader_cta", OPT_UINT32, &max_cta_per_core,
-      "Maximum number of concurrent CTAs in shader (default 8)", "8");
+      "Maximum number of concurrent CTAs in shader (default 32)", "32");
   option_parser_register(
       opp, "-gpgpu_num_cta_barriers", OPT_UINT32, &max_barriers_per_cta,
       "Maximum number of named barriers per CTA (default 16)", "16");
@@ -326,7 +558,14 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(
       opp, "-gpgpu_shmem_size", OPT_UINT32, &gpgpu_shmem_size,
       "Size of shared memory per shader core (default 16kB)", "16384");
-  option_parser_register(opp, "-gpgpu_adaptive_cache_config", OPT_UINT32,
+  option_parser_register(opp, "-gpgpu_shmem_option", OPT_CSTR,
+                         &gpgpu_shmem_option,
+                         "Option list of shared memory sizes", "0");
+  option_parser_register(
+      opp, "-gpgpu_unified_l1d_size", OPT_UINT32,
+      &m_L1D_config.m_unified_cache_size,
+      "Size of unified data cache(L1D + shared memory) in KB", "0");
+  option_parser_register(opp, "-gpgpu_adaptive_cache_config", OPT_BOOL,
                          &adaptive_cache_config, "adaptive_cache_config", "0");
   option_parser_register(
       opp, "-gpgpu_shmem_sizeDefault", OPT_UINT32, &gpgpu_shmem_sizeDefault,
@@ -556,7 +795,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
   option_parser_register(opp, "-gpgpu_max_cycle", OPT_INT64, &gpu_max_cycle_opt,
                          "terminates gpu simulation early (0 = no limit)", "0");
   option_parser_register(opp, "-gpgpu_max_insn", OPT_INT64, &gpu_max_insn_opt,
-                         "terminates gpu simulation early (0 = no limit)", "0");
+                         "terminates gpu simulation early (0 = no limit)", "300000000");
   option_parser_register(opp, "-gpgpu_max_cta", OPT_INT32, &gpu_max_cta_opt,
                          "terminates gpu simulation early (0 = no limit)", "0");
   option_parser_register(opp, "-gpgpu_max_completed_cta", OPT_INT32,
@@ -603,7 +842,8 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          "500.0:2000.0:2000.0:2000.0");
   option_parser_register(
       opp, "-gpgpu_max_concurrent_kernel", OPT_INT32, &max_concurrent_kernel,
-      "maximum kernels that can run concurrently on GPU", "8");
+      "maximum kernels that can run concurrently on GPU, set this value "
+      "according to max resident grids for your compute capability", "32");
   option_parser_register(
       opp, "-gpgpu_cflog_interval", OPT_INT32, &gpgpu_cflog_interval,
       "Interval between each snapshot in control flow logger", "0");
@@ -673,6 +913,21 @@ void increment_x_then_y_then_z(dim3 &i, const dim3 &bound) {
 }
 
 void gpgpu_sim::launch(kernel_info_t *kinfo) {
+  unsigned kernelID = kinfo->get_uid();
+  unsigned long long streamID = kinfo->get_streamID();
+  kernel_time_t kernel_time = {gpu_tot_sim_cycle + gpu_sim_cycle, 0};
+  if (gpu_kernel_time.find(streamID) == gpu_kernel_time.end()) {
+    std::map<unsigned, kernel_time_t> new_val;
+    new_val.insert(std::pair<unsigned, kernel_time_t>(kernelID, kernel_time));
+    gpu_kernel_time.insert(
+        std::pair<unsigned long long, std::map<unsigned, kernel_time_t>>(
+            streamID, new_val));
+  } else {
+    gpu_kernel_time.at(streamID).insert(
+        std::pair<unsigned, kernel_time_t>(kernelID, kernel_time));
+    ////////// assume same kernel ID do not appear more than once
+  }
+
   unsigned cta_size = kinfo->threads_per_cta();
   if (cta_size > m_shader_config->n_thread_per_shader) {
     printf(
@@ -715,10 +970,8 @@ bool gpgpu_sim::hit_max_cta_count() const {
 }
 
 bool gpgpu_sim::kernel_more_cta_left(kernel_info_t *kernel) const {
-  if (hit_max_cta_count()) return false;
-
+  if (hit_max_cta_count()) return false;  // (used for experiment early finish)
   if (kernel && !kernel->no_more_ctas_to_run()) return true;
-
   return false;
 }
 
@@ -778,7 +1031,10 @@ kernel_info_t *gpgpu_sim::select_kernel() {
 }
 
 unsigned gpgpu_sim::finished_kernel() {
-  if (m_finished_kernel.empty()) return 0;
+  if (m_finished_kernel.empty()) {
+    last_streamID = -1;
+    return 0;
+  }
   unsigned result = m_finished_kernel.front();
   m_finished_kernel.pop_front();
   return result;
@@ -786,6 +1042,11 @@ unsigned gpgpu_sim::finished_kernel() {
 
 void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
   unsigned uid = kernel->get_uid();
+  last_uid = uid;
+  unsigned long long streamID = kernel->get_streamID();
+  last_streamID = streamID;
+  gpu_kernel_time.at(streamID).at(uid).end_cycle =
+      gpu_tot_sim_cycle + gpu_sim_cycle;
   m_finished_kernel.push_back(uid);
   std::vector<kernel_info_t *>::iterator k;
   for (k = m_running_kernels.begin(); k != m_running_kernels.end(); k++) {
@@ -813,11 +1074,12 @@ void exec_gpgpu_sim::createSIMTCluster() {
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
     m_cluster[i] =
         new exec_simt_core_cluster(this, i, m_shader_config, m_memory_config,
-                                   m_shader_stats, m_memory_stats);
+                                   m_shader_stats, m_memory_stats, get_page_manager(), get_shared_tlb());
 }
 
 gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
-    : gpgpu_t(config, ctx), m_config(config) {
+    : gpgpu_t(config, ctx), m_config(config), m_memory_config(&config.m_memory_config),
+    m_shader_config(&config.m_shader_config){
   gpgpu_ctx = ctx;
   m_shader_config = &m_config.m_shader_config;
   m_memory_config = &m_config.m_memory_config;
@@ -826,12 +1088,13 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
 #ifdef GPGPUSIM_POWER_MODEL
   m_gpgpusim_wrapper = new gpgpu_sim_wrapper(config.g_power_simulation_enabled,
-                                             config.g_power_config_name);
+                                             config.g_power_config_name, config.g_power_simulation_mode, config.g_dvfs_enabled);
 #endif
 
   m_shader_stats = new shader_core_stats(m_shader_config);
   m_memory_stats = new memory_stats_t(m_config.num_shader(), m_shader_config,
                                       m_memory_config, this);
+  m_memory_stats->set_chiplet(m_memory_config->chiplet_num);
   average_pipeline_duty_cycle = (float *)malloc(sizeof(float));
   active_sms = (float *)malloc(sizeof(float));
   m_power_stats =
@@ -845,6 +1108,31 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   m_total_cta_launched = 0;
   gpu_deadlock = false;
 
+  sched_list_setup = false;
+  sched_count = 0;
+  cta_sched_list = new std::list<uint64_t>;
+  cta_batch_list = new std::list<uint64_t>;
+
+  cta_sched_mode = -1;
+  cta_batch_mode = -1;
+
+  printf("Initializing MMU\n");
+  m_page_manager = ctx->the_gpgpusim->g_mmu;
+  m_page_manager->set_m_gpu(this);
+
+  m_shared_tlb = new tlb_tag_array(m_memory_config, m_shader_stats, m_page_manager, true, m_memory_stats, m_memory_partition_unit, this);
+  printf("Done initializing shared TLB\n");
+
+  if (m_page_manager->get_need_init()){
+      m_page_manager->init2(m_memory_config);
+  }
+  m_page_manager->set_stat(m_memory_stats);
+  if (m_page_manager->get_need_init()){
+      m_page_manager->set_ready();
+  }
+
+  m_inter_noc = new inter_noc(m_memory_config, this);
+
   gpu_stall_dramfull = 0;
   gpu_stall_icnt2sh = 0;
   partiton_reqs_in_parallel = 0;
@@ -855,21 +1143,39 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   gpu_tot_sim_cycle_parition_util = 0;
   partiton_replys_in_parallel = 0;
   partiton_replys_in_parallel_total = 0;
+  last_streamID = -1;
+
+  gpu_kernel_time.clear();
+
+  // compute chiplet base
+  m_sm_chiplet_base  = static_cast<unsigned>(m_memory_config->total_sm_num) / static_cast<unsigned>(m_memory_config->chiplet_num);
+  m_sub_chiplet_base = static_cast<unsigned>(m_memory_config->m_n_mem) / static_cast<unsigned>(m_memory_config->chiplet_num);
 
   m_memory_partition_unit =
       new memory_partition_unit *[m_memory_config->m_n_mem];
   m_memory_sub_partition =
       new memory_sub_partition *[m_memory_config->m_n_mem_sub_partition];
   for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
-    m_memory_partition_unit[i] =
-        new memory_partition_unit(i, m_memory_config, m_memory_stats, this);
+      unsigned chiplet_num = i / m_sub_chiplet_base;
+      m_memory_partition_unit[i] =
+        new memory_partition_unit(i, m_memory_config, m_memory_stats, this, m_page_manager, m_shared_tlb);
+      m_memory_partition_unit[i]->set_chiplet(chiplet_num);
+      m_memory_partition_unit[i]->set_inter_noc(m_inter_noc);
+
+      //fprintf(stdout, "Setting partition %3d for chiplet %2d\n", i, chiplet_num);
     for (unsigned p = 0;
          p < m_memory_config->m_n_sub_partition_per_memory_channel; p++) {
       unsigned submpid =
           i * m_memory_config->m_n_sub_partition_per_memory_channel + p;
       m_memory_sub_partition[submpid] =
           m_memory_partition_unit[i]->get_sub_partition(p);
+      m_memory_sub_partition[submpid]->set_chiplet(chiplet_num);
+      m_memory_sub_partition[submpid]->set_inter_noc(m_inter_noc);
     }
+  }
+
+  for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+      m_memory_partition_unit[i]->set_dram(i);
   }
 
   icnt_wrapper_init();
@@ -969,8 +1275,8 @@ bool gpgpu_sim::active() {
       (gpu_tot_sim_cycle + gpu_sim_cycle) >= m_config.gpu_max_cycle_opt)
     return false;
   if (m_config.gpu_max_insn_opt &&
-      (gpu_tot_sim_insn + gpu_sim_insn) >= m_config.gpu_max_insn_opt)
-    return false;
+      (gpu_tot_sim_insn + gpu_sim_insn) >= m_config.gpu_max_insn_opt){
+    return false; }
   if (m_config.gpu_max_cta_opt &&
       (gpu_tot_issued_cta >= m_config.gpu_max_cta_opt))
     return false;
@@ -1001,6 +1307,14 @@ void gpgpu_sim::init() {
   partiton_reqs_in_parallel_util = 0;
   gpu_sim_cycle_parition_util = 0;
 
+// McPAT initialization function. Called on first launch of GPU
+#ifdef GPGPUSIM_POWER_MODEL
+  if (m_config.g_power_simulation_enabled) {
+    init_mcpat(m_config, m_gpgpusim_wrapper, m_config.gpu_stat_sample_freq,
+               gpu_tot_sim_insn, gpu_sim_insn);
+  }
+#endif
+
   reinit_clock_domains();
   gpgpu_ctx->func_sim->set_param_gpgpu_num_shaders(m_config.num_shader());
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
@@ -1026,18 +1340,9 @@ void gpgpu_sim::init() {
   }
 
   if (g_network_mode) icnt_init();
-
-    // McPAT initialization function. Called on first launch of GPU
-#ifdef GPGPUSIM_POWER_MODEL
-  if (m_config.g_power_simulation_enabled) {
-    init_mcpat(m_config, m_gpgpusim_wrapper, m_config.gpu_stat_sample_freq,
-               gpu_tot_sim_insn, gpu_sim_insn);
-  }
-#endif
 }
 
 void gpgpu_sim::update_stats() {
-  m_memory_stats->memlatstat_lat_pw();
   gpu_tot_sim_cycle += gpu_sim_cycle;
   gpu_tot_sim_insn += gpu_sim_insn;
   gpu_tot_issued_cta += m_total_cta_launched;
@@ -1058,9 +1363,15 @@ void gpgpu_sim::update_stats() {
   gpu_occupancy = occupancy_stats();
 }
 
-void gpgpu_sim::print_stats() {
+PowerscalingCoefficients *gpgpu_sim::get_scaling_coeffs()
+{
+  return m_gpgpusim_wrapper->get_scaling_coeffs();
+}
+
+void gpgpu_sim::print_stats(unsigned long long streamID) {
   gpgpu_ctx->stats->ptx_file_line_stats_write_file();
-  gpu_print_stat();
+  gpu_print_stat(streamID);
+  this->m_memory_stats->print_essential(stdout);
 
   if (g_network_mode) {
     printf(
@@ -1115,6 +1426,8 @@ void gpgpu_sim::deadlock_check() {
         "\nRe-run the simulator in gdb and use debug routines in .gdbinit to "
         "debug this\n");
     fflush(stdout);
+    fprintf(stderr, "DEADLOCK\n");
+    //m_memory_stats->print_essential(stderr);
     abort();
   }
 }
@@ -1135,6 +1448,18 @@ std::string gpgpu_sim::executed_kernel_info_string() {
   }
   statout << std::endl;
 
+  return statout.str();
+}
+
+std::string gpgpu_sim::executed_kernel_name() {
+  std::stringstream statout;
+  if( m_executed_kernel_names.size() == 1)
+     statout << m_executed_kernel_names[0];
+  else{
+    for (unsigned int k = 0; k < m_executed_kernel_names.size(); k++) {
+      statout << m_executed_kernel_names[k] << " ";
+    }
+  }
   return statout.str();
 }
 void gpgpu_sim::set_cache_config(std::string kernel_name,
@@ -1231,11 +1556,14 @@ void gpgpu_sim::clear_executed_kernel_info() {
   m_executed_kernel_names.clear();
   m_executed_kernel_uids.clear();
 }
-void gpgpu_sim::gpu_print_stat() {
+
+void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
   FILE *statfout = stdout;
 
   std::string kernel_info_str = executed_kernel_info_string();
   fprintf(statfout, "%s", kernel_info_str.c_str());
+
+  printf("kernel_stream_id = %llu\n", streamID);
 
   printf("gpu_sim_cycle = %lld\n", gpu_sim_cycle);
   printf("gpu_sim_insn = %lld\n", gpu_sim_insn);
@@ -1283,13 +1611,13 @@ void gpgpu_sim::gpu_print_stat() {
   // %lld\n", partiton_replys_in_parallel_total );
   printf("L2_BW  = %12.4f GB/Sec\n",
          ((float)(partiton_replys_in_parallel * 32) /
-          (gpu_sim_cycle * m_config.icnt_period)) /
+          (gpu_sim_cycle * m_config.core_period)) /
              1000000000);
   printf("L2_BW_total  = %12.4f GB/Sec\n",
          ((float)((partiton_replys_in_parallel +
                    partiton_replys_in_parallel_total) *
                   32) /
-          ((gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.icnt_period)) /
+          ((gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period)) /
              1000000000);
 
   time_t curr_time;
@@ -1308,19 +1636,30 @@ void gpgpu_sim::gpu_print_stat() {
     m_cluster[i]->get_cache_stats(core_cache_stats);
   }
   printf("\nTotal_core_cache_stats:\n");
-  core_cache_stats.print_stats(stdout, "Total_core_cache_stats_breakdown");
+  core_cache_stats.print_stats(stdout, streamID,
+                               "Total_core_cache_stats_breakdown");
   printf("\nTotal_core_cache_fail_stats:\n");
-  core_cache_stats.print_fail_stats(stdout,
+  core_cache_stats.print_fail_stats(stdout, streamID,
                                     "Total_core_cache_fail_stats_breakdown");
   shader_print_scheduler_stat(stdout, false);
 
   m_shader_stats->print(stdout);
 #ifdef GPGPUSIM_POWER_MODEL
   if (m_config.g_power_simulation_enabled) {
+    if(m_config.g_power_simulation_mode > 0){
+        //if(!m_config.g_aggregate_power_stats)
+          mcpat_reset_perf_count(m_gpgpusim_wrapper);
+        calculate_hw_mcpat(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,
+                  m_power_stats, m_config.gpu_stat_sample_freq,
+                  gpu_tot_sim_cycle, gpu_sim_cycle, gpu_tot_sim_insn,
+                  gpu_sim_insn, m_config.g_power_simulation_mode, m_config.g_dvfs_enabled,
+                  m_config.g_hw_perf_file_name, m_config.g_hw_perf_bench_name, executed_kernel_name(), m_config.accelwattch_hybrid_configuration, m_config.g_aggregate_power_stats);
+    }
     m_gpgpusim_wrapper->print_power_kernel_stats(
         gpu_sim_cycle, gpu_tot_sim_cycle, gpu_tot_sim_insn + gpu_sim_insn,
         kernel_info_str, true);
-    mcpat_reset_perf_count(m_gpgpusim_wrapper);
+    //if(!m_config.g_aggregate_power_stats)
+      mcpat_reset_perf_count(m_gpgpusim_wrapper);
   }
 #endif
 
@@ -1365,9 +1704,10 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_reservation_fails = %llu\n",
              total_l2_css.res_fails);
       printf("L2_total_cache_breakdown:\n");
-      l2_stats.print_stats(stdout, "L2_cache_stats_breakdown");
+      l2_stats.print_stats(stdout, streamID, "L2_cache_stats_breakdown");
       printf("L2_total_cache_reservation_fail_breakdown:\n");
-      l2_stats.print_fail_stats(stdout, "L2_cache_stats_fail_breakdown");
+      l2_stats.print_fail_stats(stdout, streamID,
+                                "L2_cache_stats_fail_breakdown");
       total_l2_css.print_port_stats(stdout, "L2_cache");
     }
   }
@@ -1514,9 +1854,9 @@ bool shader_core_ctx::occupy_shader_resource_1block(kernel_info_t &k,
 
     SHADER_DPRINTF(LIVENESS,
                    "GPGPU-Sim uArch: Occupied %u threads, %u shared mem, %u "
-                   "registers, %u ctas\n",
+                   "registers, %u ctas, on shader %d\n",
                    m_occupied_n_threads, m_occupied_shmem, m_occupied_regs,
-                   m_occupied_ctas);
+                   m_occupied_ctas, m_sid);
   }
 
   return true;
@@ -1573,6 +1913,16 @@ unsigned exec_shader_core_ctx::sim_init_thread(
                              num_threads, core, hw_cta_id, hw_warp_id, gpu);
 }
 
+unsigned exec_shader_core_ctx::sim_init_thread(
+    kernel_info_t &kernel, ptx_thread_info **thread_info, int sid, unsigned int tid,
+    unsigned int threads_left, unsigned int num_threads, core_t *core,
+    unsigned int hw_cta_id, unsigned int hw_warp_id, gpgpu_t *gpu,
+    unsigned int chiplet, unsigned mode, unsigned batch) {
+  return ptx_sim_init_thread(kernel, thread_info, sid, tid, threads_left,
+                             num_threads, core, hw_cta_id, hw_warp_id, gpu,
+                             chiplet, mode, batch);
+}
+
 void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
   if (!m_config->gpgpu_concurrent_kernel_sm)
     set_max_cta(kernel);
@@ -1590,7 +1940,7 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
   else
     max_cta_per_core = m_config->max_cta_per_core;
   for (unsigned i = 0; i < max_cta_per_core; i++) {
-    if (m_cta_status[i] == 0) {
+    if (m_cta_status[i] == 0) {  // if find a free cta, allocate s new cta
       free_cta_hw_id = i;
       break;
     }
@@ -1598,19 +1948,19 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
   assert(free_cta_hw_id != (unsigned)-1);
 
   // determine hardware threads and warps that will be used for this CTA
-  int cta_size = kernel.threads_per_cta();
+  int cta_size = kernel.threads_per_cta();  // get block dim
 
   // hw warp id = hw thread id mod warp size, so we need to find a range
   // of hardware thread ids corresponding to an integral number of hardware
   // thread ids
   int padded_cta_size = cta_size;
-  if (cta_size % m_config->warp_size)
+  if (cta_size % m_config->warp_size)    // padding cta size to fit n * warp_size
     padded_cta_size =
         ((cta_size / m_config->warp_size) + 1) * (m_config->warp_size);
 
   unsigned int start_thread, end_thread;
 
-  if (!m_config->gpgpu_concurrent_kernel_sm) {
+  if (!m_config->gpgpu_concurrent_kernel_sm) {  // always go here
     start_thread = free_cta_hw_id * padded_cta_size;
     end_thread = start_thread + cta_size;
   } else {
@@ -1624,7 +1974,7 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
 
   // reset the microarchitecture state of the selected hardware thread and warp
   // contexts
-  reinit(start_thread, end_thread, false);
+  reinit(start_thread, end_thread, false);  // reset old cta information
 
   // initalize scalar threads and determine which hardware warps they are
   // allocated to bind functional simulation state of threads to hardware
@@ -1682,9 +2032,137 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
   shader_CTA_count_log(m_sid, 1);
   SHADER_DPRINTF(LIVENESS,
                  "GPGPU-Sim uArch: cta:%2u, start_tid:%4u, end_tid:%4u, "
-                 "initialized @(%lld,%lld)\n",
+                 "initialized @(%lld,%lld), kernel_uid:%u, kernel_name:%s\n",
                  free_cta_hw_id, start_thread, end_thread, m_gpu->gpu_sim_cycle,
-                 m_gpu->gpu_tot_sim_cycle);
+                 m_gpu->gpu_tot_sim_cycle, kernel.get_uid(), kernel.get_name().c_str());
+}
+
+void shader_core_ctx::issue_block2core(class kernel_info_t &kernel, unsigned chiplet, unsigned mode, unsigned batch) {
+  switch (mode) {
+      case CTA_DISTRIBUTED:
+      case CTA_KERNEL_WIDE:
+      case CTA_ALIGNMENT:
+      case CTA_ROW_BIND:
+      case CTA_COLUMN_BIND: {
+          if (!m_config->gpgpu_concurrent_kernel_sm)
+            set_max_cta(kernel);
+          else
+            assert(occupy_shader_resource_1block(kernel, true));  // not used
+
+          kernel.inc_running();
+
+          // find a free CTA context
+          unsigned free_cta_hw_id = (unsigned)-1;
+
+          unsigned max_cta_per_core;
+          if (!m_config->gpgpu_concurrent_kernel_sm)
+            max_cta_per_core = kernel_max_cta_per_shader;
+          else
+            max_cta_per_core = m_config->max_cta_per_core;
+          for (unsigned i = 0; i < max_cta_per_core; i++) {
+            if (m_cta_status[i] == 0) {  // if find a free cta, allocate a new cta
+              free_cta_hw_id = i;
+              break;
+            }
+          }
+          assert(free_cta_hw_id != (unsigned)-1);
+
+          // determine hardware threads and warps that will be used for this CTA
+          int cta_size = kernel.threads_per_cta();  // get block dim
+
+          // hw warp id = hw thread id mod warp size, so we need to find a range
+          // of hardware thread ids corresponding to an integral number of hardware
+          // thread ids
+          int padded_cta_size = cta_size;
+          if (cta_size % m_config->warp_size)    // padding cta size to fit n * warp_size
+            padded_cta_size =
+                ((cta_size / m_config->warp_size) + 1) * (m_config->warp_size);
+
+          unsigned int start_thread, end_thread;
+
+          if (!m_config->gpgpu_concurrent_kernel_sm) {  // always go here
+            start_thread = free_cta_hw_id * padded_cta_size;
+            end_thread = start_thread + cta_size;
+          } else {
+            start_thread = find_available_hwtid(padded_cta_size, true);
+            assert((int)start_thread != -1);
+            end_thread = start_thread + cta_size;
+            assert(m_occupied_cta_to_hwtid.find(free_cta_hw_id) ==
+                   m_occupied_cta_to_hwtid.end());
+            m_occupied_cta_to_hwtid[free_cta_hw_id] = start_thread;
+          }
+
+          // reset the microarchitecture state of the selected hardware thread and warp
+          // contexts
+          reinit(start_thread, end_thread, false);  // reset old cta information
+
+          // initalize scalar threads and determine which hardware warps they are
+          // allocated to bind functional simulation state of threads to hardware
+          // resources (simulation)
+          warp_set_t warps;
+          unsigned nthreads_in_block = 0;
+          function_info *kernel_func_info = kernel.entry();
+          symbol_table *symtab = kernel_func_info->get_symtab();
+          unsigned ctaid = kernel.get_next_cta_id_single(chiplet, mode, batch);
+          checkpoint *g_checkpoint = new checkpoint();
+          for (unsigned i = start_thread; i < end_thread; i++) {
+            m_threadState[i].m_cta_id = free_cta_hw_id;
+            unsigned warp_id = i / m_config->warp_size;
+            nthreads_in_block += sim_init_thread(
+                kernel, &m_thread[i], m_sid, i, cta_size - (i - start_thread),
+                m_config->n_thread_per_shader, this, free_cta_hw_id, warp_id,
+                m_cluster->get_gpu(), chiplet, mode, batch);
+            m_threadState[i].m_active = true;
+            // load thread local memory and register file
+            if (m_gpu->resume_option == 1 && kernel.get_uid() == m_gpu->resume_kernel &&
+                ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
+              assert(0);
+              char fname[2048];
+              snprintf(fname, 2048, "checkpoint_files/thread_%d_%d_reg.txt",
+                       i % cta_size, ctaid);
+              m_thread[i]->resume_reg_thread(fname, symtab);
+              char f1name[2048];
+              snprintf(f1name, 2048, "checkpoint_files/local_mem_thread_%d_%d_reg.txt",
+                       i % cta_size, ctaid);
+              g_checkpoint->load_global_mem(m_thread[i]->m_local_mem, f1name);
+            }
+            //
+            warps.set(warp_id);
+          }
+          assert(nthreads_in_block > 0 &&
+                 nthreads_in_block <=
+                     m_config->n_thread_per_shader);  // should be at least one, but
+                                                      // less than max
+          m_cta_status[free_cta_hw_id] = nthreads_in_block;
+
+          if (m_gpu->resume_option == 1 && kernel.get_uid() == m_gpu->resume_kernel &&
+              ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
+            assert(0);
+            char f1name[2048];
+            snprintf(f1name, 2048, "checkpoint_files/shared_mem_%d.txt", ctaid);
+
+            g_checkpoint->load_global_mem(m_thread[start_thread]->m_shared_mem, f1name);
+          }
+          // now that we know which warps are used in this CTA, we can allocate
+          // resources for use in CTA-wide barrier operations
+          m_barriers.allocate_barrier(free_cta_hw_id, warps);
+
+          // initialize the SIMT stacks and fetch hardware
+          init_warps(free_cta_hw_id, start_thread, end_thread, ctaid, cta_size, kernel);
+          m_n_active_cta++;
+
+          shader_CTA_count_log(m_sid, 1);
+          SHADER_DPRINTF(LIVENESS,
+                         "GPGPU-Sim uArch: cta:%2u, start_tid:%4u, end_tid:%4u, "
+                         "initialized @(%lld,%lld), kernel_uid:%u, kernel_name:%s\n",
+                         free_cta_hw_id, start_thread, end_thread, m_gpu->gpu_sim_cycle,
+                         m_gpu->gpu_tot_sim_cycle, kernel.get_uid(), kernel.get_name().c_str());
+          break;
+      }
+      default:
+          assert(0 && "Should not reach here!");
+          break;
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -1722,6 +2200,7 @@ int gpgpu_sim::next_clock_domain(void) {
   return mask;
 }
 
+// baseline random cta scheduling
 void gpgpu_sim::issue_block2core() {
   unsigned last_issued = m_last_cluster_issue;
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
@@ -1732,6 +2211,46 @@ void gpgpu_sim::issue_block2core() {
       m_total_cta_launched += num;
     }
   }
+}
+
+void gpgpu_sim::issue_block2core(bool chiplet, unsigned mode, unsigned batch) {
+    switch (mode) {
+        case (CTA_DISTRIBUTED || CTA_KERNEL_WIDE): {
+            unsigned last_issued = m_last_cluster_issue;
+            for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+                unsigned idx = (i + last_issued + 1) % m_shader_config->n_simt_clusters;
+                unsigned chiplet_num = idx / m_sm_chiplet_base;
+                assert(chiplet_num < m_memory_config->chiplet_num);
+                unsigned num = m_cluster[idx]->issue_block2core(chiplet_num, mode, batch);
+                if (num) {
+                    m_last_cluster_issue = idx;
+                    m_total_cta_launched += num;
+                }
+            }
+            break;
+        }
+        case CTA_ALIGNMENT:
+        case CTA_ROW_BIND:
+        case CTA_COLUMN_BIND: {
+            assert(batch != 0);
+            unsigned last_issued = m_last_cluster_issue;
+            for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+                unsigned idx = (i + last_issued + 1) % m_shader_config->n_simt_clusters;
+                unsigned chiplet_num = idx / m_sm_chiplet_base;
+                assert(chiplet_num < m_memory_config->chiplet_num);
+                unsigned num = m_cluster[idx]->issue_block2core(chiplet_num, mode, batch);
+                if (num) {
+                    m_last_cluster_issue = idx;
+                    m_total_cta_launched += num;
+                }
+            }
+            break;
+        }
+        default: {
+            assert(0 && 'Should not reach here!');
+            break;
+        }
+    }
 }
 
 unsigned long long g_single_step =
@@ -1787,6 +2306,7 @@ void gpgpu_sim::cycle() {
           m_power_stats->pwr_mem_stat->n_pre[CURRENT_STAT_IDX][i],
           m_power_stats->pwr_mem_stat->n_rd[CURRENT_STAT_IDX][i],
           m_power_stats->pwr_mem_stat->n_wr[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_wr_WB[CURRENT_STAT_IDX][i],
           m_power_stats->pwr_mem_stat->n_req[CURRENT_STAT_IDX][i]);
     }
   }
@@ -1808,8 +2328,35 @@ void gpgpu_sim::cycle() {
         if (mf) partiton_reqs_in_parallel_per_cycle++;
       }
       m_memory_sub_partition[i]->cache_cycle(gpu_sim_cycle + gpu_tot_sim_cycle);
-      m_memory_sub_partition[i]->accumulate_L2cache_stats(
-          m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX]);
+      if (m_config.g_power_simulation_enabled) {
+        m_memory_sub_partition[i]->accumulate_L2cache_stats(
+            m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX]);
+      }
+    }
+
+    // L2 TLB access handle
+    m_shared_tlb->cycle();
+
+    // inter-chip interconnect cycle
+    m_inter_noc->cycle();
+    // handle request
+    for (auto i = 0u; i < m_memory_config->chiplet_num; i++){
+      while (true) {
+        flit_wrapper* get_wrap = m_inter_noc->pop_received(i);
+        if (get_wrap != nullptr) {
+            inter_flit* get_flit = get_wrap->m_flit;
+            delete get_wrap;
+            if (get_flit->m_is_refly) {
+                m_memory_sub_partition[get_flit->m_mf->get_tlx_addr().request_sub_partition]->handle_remote_response(get_flit->m_mf);
+                delete get_flit;
+            } else {
+                m_memory_sub_partition[get_flit->m_mf->get_tlx_addr().sub_partition]->handle_remote_access(get_flit->m_mf);
+                delete get_flit;
+            }
+        } else {
+            break;
+        }
+      }
     }
   }
   partiton_reqs_in_parallel += partiton_reqs_in_parallel_per_cycle;
@@ -1830,15 +2377,17 @@ void gpgpu_sim::cycle() {
         m_cluster[i]->core_cycle();
         *active_sms += m_cluster[i]->get_n_active_sms();
       }
-      // Update core icnt/cache stats for GPUWattch
-      m_cluster[i]->get_icnt_stats(
-          m_power_stats->pwr_mem_stat->n_simt_to_mem[CURRENT_STAT_IDX][i],
-          m_power_stats->pwr_mem_stat->n_mem_to_simt[CURRENT_STAT_IDX][i]);
-      m_cluster[i]->get_cache_stats(
-          m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX]);
-      m_cluster[i]->get_current_occupancy(
-          gpu_occupancy.aggregate_warp_slot_filled,
-          gpu_occupancy.aggregate_theoretical_warp_slots);
+      // Update core icnt/cache stats for AccelWattch
+      if (m_config.g_power_simulation_enabled) {
+        m_cluster[i]->get_icnt_stats(
+            m_power_stats->pwr_mem_stat->n_simt_to_mem[CURRENT_STAT_IDX][i],
+            m_power_stats->pwr_mem_stat->n_mem_to_simt[CURRENT_STAT_IDX][i]);
+        m_cluster[i]->get_cache_stats(
+            m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX]);
+        m_cluster[i]->get_current_occupancy(
+            gpu_occupancy.aggregate_warp_slot_filled,
+            gpu_occupancy.aggregate_theoretical_warp_slots);
+      }
     }
     float temp = 0;
     for (unsigned i = 0; i < m_shader_config->num_shader(); i++) {
@@ -1860,14 +2409,54 @@ void gpgpu_sim::cycle() {
       // McPAT main cycle (interface with McPAT)
 #ifdef GPGPUSIM_POWER_MODEL
     if (m_config.g_power_simulation_enabled) {
+      if(m_config.g_power_simulation_mode == 0){
       mcpat_cycle(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,
                   m_power_stats, m_config.gpu_stat_sample_freq,
                   gpu_tot_sim_cycle, gpu_sim_cycle, gpu_tot_sim_insn,
-                  gpu_sim_insn);
+                  gpu_sim_insn, m_config.g_dvfs_enabled);
+      }
     }
 #endif
 
-    issue_block2core();
+    if (m_memory_config->static_cta_multi_enable && !sched_list_setup){
+      set_up_sched_list();
+      sched_list_setup = true;
+    }
+
+    unsigned sched_mode;
+    unsigned batch_mode;
+    if (m_memory_config->static_cta_multi_enable){
+      sched_mode = cta_sched_mode;
+      batch_mode = cta_batch_mode;
+    } else {
+      sched_mode = m_memory_config->mcm_cta_schedule;
+      batch_mode = m_memory_config->cta_batch;
+    }
+
+    switch (sched_mode) {
+      case CTA_BASE_RR:
+          issue_block2core();
+          break;
+      case CTA_DISTRIBUTED:
+          issue_block2core(true, CTA_DISTRIBUTED, 0);
+          break;
+      case CTA_KERNEL_WIDE:
+          issue_block2core(true, CTA_KERNEL_WIDE, 0);
+          break;
+      case CTA_ALIGNMENT:
+          issue_block2core(true, CTA_ALIGNMENT, batch_mode);
+          break;
+      case CTA_ROW_BIND:
+          issue_block2core(true, CTA_ROW_BIND, batch_mode);
+          break;
+      case CTA_COLUMN_BIND:
+          issue_block2core(true, CTA_COLUMN_BIND, batch_mode);
+          break;
+      default:
+          assert(0);  // does not happen
+          break;
+    }
+
     decrement_kernel_latency();
 
     // Depending on configuration, invalidate the caches once all of threads are
@@ -1924,7 +2513,7 @@ void gpgpu_sim::cycle() {
           m_cluster[i]->get_current_occupancy(active, total);
         }
         DPRINTFG(LIVENESS,
-                 "uArch: inst.: %lld (ipc=%4.1f, occ=%0.4f\% [%llu / %llu]) "
+                 "uArch: inst.: %lld (ipc=%4.1f, occ=%0.4f%% [%llu / %llu]) "
                  "sim_rate=%u (inst/sec) elapsed = %u:%u:%02u:%02u / %s",
                  gpu_tot_sim_insn + gpu_sim_insn,
                  (double)gpu_sim_insn / (double)gpu_sim_cycle,
@@ -1933,10 +2522,20 @@ void gpgpu_sim::cycle() {
                  (unsigned)days, (unsigned)hrs, (unsigned)minutes,
                  (unsigned)sec, ctime(&curr_time));
         fflush(stdout);
+
+        // print intermediate stat
+        printf("uArch: inst.: %lld (ipc=%4.1f, occ=%0.4f%% [%llu / %llu]) "
+            "sim_rate=%u (inst/sec) elapsed = %u:%u:%02u:%02u / %s",
+            gpu_tot_sim_insn + gpu_sim_insn,
+            (double)gpu_sim_insn / (double)gpu_sim_cycle,
+            float(active) / float(total) * 100, active, total,
+            (unsigned)((gpu_tot_sim_insn + gpu_sim_insn) / elapsed_time),
+            (unsigned)days, (unsigned)hrs, (unsigned)minutes,
+            (unsigned)sec, ctime(&curr_time));
+
         last_liveness_message_time = elapsed_time;
       }
       visualizer_printstat();
-      m_memory_stats->memlatstat_lat_pw();
       if (m_config.gpgpu_runtime_stat &&
           (m_config.gpu_runtime_stat_flag != 0)) {
         if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_BW_STAT) {
@@ -1954,7 +2553,7 @@ void gpgpu_sim::cycle() {
       }
     }
 
-    if (!(gpu_sim_cycle % 50000)) {
+    if (!(gpu_sim_cycle % 1000000)) {
       // deadlock detection
       if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn) {
         gpu_deadlock = true;
@@ -1962,6 +2561,7 @@ void gpgpu_sim::cycle() {
         last_gpu_sim_insn = gpu_sim_insn;
       }
     }
+
     try_snap_shot(gpu_sim_cycle);
     spill_log_to_file(stdout, 0, gpu_sim_cycle);
 
@@ -1970,6 +2570,11 @@ void gpgpu_sim::cycle() {
     gpgpu_ctx->device_runtime->launch_one_device_kernel();
 #endif
   }
+}
+
+void gpgpu_sim::print_period_stat() {
+    printf("uArch: inst.: %lld <- -> ipc=%4.1f\n", gpu_tot_sim_insn + gpu_sim_insn,
+           (double)gpu_sim_insn / (double)gpu_sim_cycle);
 }
 
 void shader_core_ctx::dump_warp_state(FILE *fout) const {
@@ -1986,12 +2591,13 @@ void gpgpu_sim::perf_memcpy_to_gpu(size_t dst_start_addr, size_t count) {
     // 32
     //== 0);
 
+    assert(0 && "Not supported configuration!!\n");
     for (unsigned counter = 0; counter < count; counter += 32) {
       const unsigned wr_addr = dst_start_addr + counter;
       addrdec_t raw_addr;
       mem_access_sector_mask_t mask;
       mask.set(wr_addr % 128 / 32);
-      m_memory_config->m_address_mapping.addrdec_tlx(wr_addr, &raw_addr);
+      m_memory_config->m_address_mapping.addrdec_tlx(wr_addr, &raw_addr, 1, 0, true, 0);
       const unsigned partition_id =
           raw_addr.sub_partition /
           m_memory_config->m_n_sub_partition_per_memory_channel;
@@ -2051,3 +2657,251 @@ const shader_core_config *gpgpu_sim::getShaderCoreConfig() {
 const memory_config *gpgpu_sim::getMemoryConfig() { return m_memory_config; }
 
 simt_core_cluster *gpgpu_sim::getSIMTCluster() { return *m_cluster; }
+
+void gpgpu_sim::gpu_print_stat_file(unsigned long long streamID, FILE* outputfile) {
+    FILE *statfout = outputfile;
+
+    std::string kernel_info_str = executed_kernel_info_string();
+    fprintf(statfout, "%s", kernel_info_str.c_str());
+
+    fprintf(outputfile, "kernel_stream_id = %llu\n", streamID);
+
+    fprintf(outputfile, "gpu_sim_cycle = %lld\n", gpu_sim_cycle);
+    fprintf(outputfile, "gpu_sim_insn = %lld\n", gpu_sim_insn);
+    fprintf(outputfile, "gpu_ipc = %12.4f\n", (float)gpu_sim_insn / gpu_sim_cycle);
+    fprintf(outputfile, "gpu_tot_sim_cycle = %lld\n", gpu_tot_sim_cycle + gpu_sim_cycle);
+    fprintf(outputfile, "gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + gpu_sim_insn);
+    fprintf(outputfile, "gpu_tot_ipc = %12.4f\n", (float)(gpu_tot_sim_insn + gpu_sim_insn) /
+                                     (gpu_tot_sim_cycle + gpu_sim_cycle));
+    fprintf(outputfile, "gpu_tot_issued_cta = %lld\n",
+           gpu_tot_issued_cta + m_total_cta_launched);
+    fprintf(outputfile, "gpu_occupancy = %.4f%% \n", gpu_occupancy.get_occ_fraction() * 100);
+    fprintf(outputfile, "gpu_tot_occupancy = %.4f%% \n",
+           (gpu_occupancy + gpu_tot_occupancy).get_occ_fraction() * 100);
+
+    fprintf(statfout, "max_total_param_size = %llu\n",
+            gpgpu_ctx->device_runtime->g_max_total_param_size);
+
+    // performance counter for stalls due to congestion.
+    fprintf(outputfile, "gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
+    fprintf(outputfile, "gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
+
+    // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
+    // printf("partiton_reqs_in_parallel_total    = %lld\n",
+    // partiton_reqs_in_parallel_total );
+    fprintf(outputfile, "partiton_level_parallism = %12.4f\n",
+           (float)partiton_reqs_in_parallel / gpu_sim_cycle);
+    fprintf(outputfile, "partiton_level_parallism_total  = %12.4f\n",
+           (float)(partiton_reqs_in_parallel + partiton_reqs_in_parallel_total) /
+           (gpu_tot_sim_cycle + gpu_sim_cycle));
+    // printf("partiton_reqs_in_parallel_util = %lld\n",
+    // partiton_reqs_in_parallel_util);
+    // printf("partiton_reqs_in_parallel_util_total    = %lld\n",
+    // partiton_reqs_in_parallel_util_total ); printf("gpu_sim_cycle_parition_util
+    // = %lld\n", gpu_sim_cycle_parition_util);
+    // printf("gpu_tot_sim_cycle_parition_util    = %lld\n",
+    // gpu_tot_sim_cycle_parition_util );
+    fprintf(outputfile, "partiton_level_parallism_util = %12.4f\n",
+           (float)partiton_reqs_in_parallel_util / gpu_sim_cycle_parition_util);
+    fprintf(outputfile, "partiton_level_parallism_util_total  = %12.4f\n",
+           (float)(partiton_reqs_in_parallel_util +
+                   partiton_reqs_in_parallel_util_total) /
+           (gpu_sim_cycle_parition_util + gpu_tot_sim_cycle_parition_util));
+    // printf("partiton_replys_in_parallel = %lld\n",
+    // partiton_replys_in_parallel); printf("partiton_replys_in_parallel_total =
+    // %lld\n", partiton_replys_in_parallel_total );
+    fprintf(outputfile, "L2_BW  = %12.4f GB/Sec\n",
+           ((float)(partiton_replys_in_parallel * 32) /
+            (gpu_sim_cycle * m_config.icnt_period)) /
+           1000000000);
+    fprintf(outputfile, "L2_BW_total  = %12.4f GB/Sec\n",
+           ((float)((partiton_replys_in_parallel +
+                     partiton_replys_in_parallel_total) *
+                    32) /
+            ((gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.icnt_period)) /
+           1000000000);
+
+    time_t curr_time;
+    time(&curr_time);
+    unsigned long long elapsed_time =
+            MAX(curr_time - gpgpu_ctx->the_gpgpusim->g_simulation_starttime, 1);
+    fprintf(outputfile, "gpu_total_sim_rate=%u\n",
+           (unsigned)((gpu_tot_sim_insn + gpu_sim_insn) / elapsed_time));
+
+    time_t days, hrs, minutes, sec;
+    days = elapsed_time / (3600 * 24);
+    hrs = elapsed_time / 3600 - 24 * days;
+    minutes = elapsed_time / 60 - 60 * (hrs + 24 * days);
+    sec = elapsed_time - 60 * (minutes + 60 * (hrs + 24 * days));
+
+    fprintf(stderr, "elapsed = %u:%u:%02u:%02u / %s\n",
+        (unsigned)days, (unsigned)hrs, (unsigned)minutes,
+        (unsigned)sec, ctime(&curr_time));
+
+    shader_print_cache_stats(outputfile);
+
+    cache_stats core_cache_stats;
+    core_cache_stats.clear();
+    for (unsigned i = 0; i < m_config.num_cluster(); i++) {
+        m_cluster[i]->get_cache_stats(core_cache_stats);
+    }
+    fprintf(outputfile, "\nTotal_core_cache_stats:\n");
+    core_cache_stats.print_stats(outputfile, streamID,
+                                 "Total_core_cache_stats_breakdown");
+    fprintf(outputfile, "\nTotal_core_cache_fail_stats:\n");
+    core_cache_stats.print_fail_stats(outputfile, streamID,
+                                      "Total_core_cache_fail_stats_breakdown");
+    shader_print_scheduler_stat(outputfile, false);
+
+    m_shader_stats->print(outputfile);
+#ifdef GPGPUSIM_POWER_MODEL
+    /*
+    if (m_config.g_power_simulation_enabled) {
+    m_gpgpusim_wrapper->print_power_kernel_stats(
+        gpu_sim_cycle, gpu_tot_sim_cycle, gpu_tot_sim_insn + gpu_sim_insn,
+        kernel_info_str, true);
+    mcpat_reset_perf_count(m_gpgpusim_wrapper);
+  } */
+#endif
+
+    // performance counter that are not local to one shader
+    m_memory_stats->memlatstat_print_file(outputfile, m_memory_config->m_n_mem,
+                                     m_memory_config->nbk);
+    for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
+        m_memory_partition_unit[i]->print(outputfile);
+
+    // L2 cache stats
+    if (!m_memory_config->m_L2_config.disabled()) {
+        cache_stats l2_stats;
+        struct cache_sub_stats l2_css;
+        struct cache_sub_stats total_l2_css;
+        l2_stats.clear();
+        l2_css.clear();
+        total_l2_css.clear();
+
+        fprintf(outputfile, "\n========= L2 cache stats =========\n");
+        for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+            m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
+            m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
+
+            fprintf(outputfile,
+                    "L2_cache_bank[%d]: Access = %llu, Miss = %llu, Miss_rate = "
+                    "%.3lf, Pending_hits = %llu, Reservation_fails = %llu\n",
+                    i, l2_css.accesses, l2_css.misses,
+                    (double)l2_css.misses / (double)l2_css.accesses,
+                    l2_css.pending_hits, l2_css.res_fails);
+
+            total_l2_css += l2_css;
+        }
+        if (!m_memory_config->m_L2_config.disabled() &&
+            m_memory_config->m_L2_config.get_num_lines()) {
+            // L2c_print_cache_stat();
+            fprintf(outputfile, "L2_total_cache_accesses = %llu\n", total_l2_css.accesses);
+            fprintf(outputfile, "L2_total_cache_misses = %llu\n", total_l2_css.misses);
+            if (total_l2_css.accesses > 0)
+                fprintf(outputfile, "L2_total_cache_miss_rate = %.4lf\n",
+                       (double)total_l2_css.misses / (double)total_l2_css.accesses);
+            fprintf(outputfile, "L2_total_cache_pending_hits = %llu\n", total_l2_css.pending_hits);
+            fprintf(outputfile, "L2_total_cache_reservation_fails = %llu\n",
+                   total_l2_css.res_fails);
+            fprintf(outputfile, "L2_total_cache_breakdown:\n");
+            l2_stats.print_stats(outputfile, streamID, "L2_cache_stats_breakdown");
+            fprintf(outputfile, "L2_total_cache_reservation_fail_breakdown:\n");
+            l2_stats.print_fail_stats(outputfile, streamID, "L2_cache_stats_fail_breakdown");
+            total_l2_css.print_port_stats(outputfile, "L2_cache");
+        }
+    }
+
+    if (m_config.gpgpu_cflog_interval != 0) {
+        spill_log_to_file(outputfile, 1, gpu_sim_cycle);
+        insn_warp_occ_print(outputfile);
+    }
+    /*
+    if (gpgpu_ctx->func_sim->gpgpu_ptx_instruction_classification) {
+        StatDisp(gpgpu_ctx->func_sim->g_inst_classification_stat
+                 [gpgpu_ctx->func_sim->g_ptx_kernel_count]);
+        StatDisp(gpgpu_ctx->func_sim->g_inst_op_classification_stat
+                 [gpgpu_ctx->func_sim->g_ptx_kernel_count]);
+    } */
+
+#ifdef GPGPUSIM_POWER_MODEL
+    /*
+    if (m_config.g_power_simulation_enabled) {
+    m_gpgpusim_wrapper->detect_print_steady_state(
+        1, gpu_tot_sim_insn + gpu_sim_insn);
+  } */
+#endif
+
+    // Interconnect power stat print
+    long total_simt_to_mem = 0;
+    long total_mem_to_simt = 0;
+    long temp_stm = 0;
+    long temp_mts = 0;
+    for (unsigned i = 0; i < m_config.num_cluster(); i++) {
+        m_cluster[i]->get_icnt_stats(temp_stm, temp_mts);
+        total_simt_to_mem += temp_stm;
+        total_mem_to_simt += temp_mts;
+    }
+    fprintf(outputfile, "\nicnt_total_pkts_mem_to_simt=%ld\n", total_mem_to_simt);
+    fprintf(outputfile, "icnt_total_pkts_simt_to_mem=%ld\n", total_simt_to_mem);
+    fprintf(outputfile, "\n");
+
+    this->m_memory_stats->print_essential(outputfile);
+    fflush(outputfile);
+    clear_executed_kernel_info();
+}
+
+void gpgpu_sim::print_stat_file(unsigned long long streamID) {
+    //std::stringstream filename;
+    //filename << "output" << ".txt";
+    //std::string ostr_stat = filename.str();
+    //FILE* outfile = fopen(ostr_stat.c_str(), "w+");
+    FILE* outfile = stderr;
+    gpu_print_stat_file(streamID, outfile);  // TODO: need update for multi stream
+    fflush(outfile);
+    //fclose(outfile);
+}
+
+void gpgpu_sim::reset_cta_schedule() {
+    m_last_cluster_issue = m_shader_config->n_simt_clusters -1;
+}
+
+void gpgpu_sim::set_up_sched_list() {
+    cta_sched_mode = m_memory_config->cta_sched_map->at(sched_count);
+    cta_batch_mode = m_memory_config->cta_batch_map->at(sched_count);
+
+    fprintf(stderr, "CTA sched mode = %5d\n", cta_sched_mode);
+    fprintf(stderr, "CTA batch mode = %5d\n", cta_batch_mode);
+}
+
+void gpgpu_sim::increase_sched_count() {
+    if (!m_memory_config->static_cta_multi_enable) return;
+
+    sched_count += 1;
+    cta_sched_mode = m_memory_config->cta_sched_map->at(sched_count);
+    cta_batch_mode = m_memory_config->cta_batch_map->at(sched_count);
+
+    fprintf(stderr, "CTA sched mode - update = %5d\n", cta_sched_mode);
+    fprintf(stderr, "CTA batch mode - update = %5d\n", cta_batch_mode);
+}
+
+unsigned long long gpgpu_sim::get_elapsed_time() {
+    time_t curr_time;
+    time(&curr_time);
+    unsigned long long elapsed_time =
+        MAX(curr_time - gpgpu_ctx->the_gpgpusim->g_simulation_starttime, 1);
+
+    return elapsed_time;
+}
+
+void gpgpu_sim::flush_caches(new_addr_type vpn_64) {
+    // Step1: flush L1 caches
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+        m_cluster[i]->cache_flush(vpn_64);
+    }
+
+    // Step2: flush L2 caches
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++){
+        m_memory_sub_partition[i]->flush(vpn_64);
+    }
+}

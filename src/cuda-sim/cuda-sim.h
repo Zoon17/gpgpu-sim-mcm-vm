@@ -1,3 +1,8 @@
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
 // Copyright (c) 2009-2011, Tor M. Aamodt
 // The University of British Columbia
 // All rights reserved.
@@ -42,6 +47,16 @@ class memory_space;
 class function_info;
 class symbol_table;
 
+enum PAGE_PLACEMENT {
+  PAGE_BASE_RR              =0,
+  PAGE_FIRST_TOUCH          =1,
+  PAGE_KERNEL_WIDE          =2,
+  PAGE_ADVANCED_KERNEL_WIDE =3,
+  PAGE_STRIDE               =4,
+  PAGE_ROW                  =5,
+  PAGE_COLUMN               =6
+};
+
 extern const char *g_gpgpusim_version_string;
 extern int g_debug_execution;
 
@@ -56,8 +71,65 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
                              unsigned hw_cta_id, unsigned hw_warp_id,
                              gpgpu_t *gpu,
                              bool functionalSimulationMode = false);
+unsigned ptx_sim_init_thread(kernel_info_t &kernel,
+                             class ptx_thread_info **thread_info, int sid,
+                             unsigned tid, unsigned threads_left,
+                             unsigned num_threads, class core_t *core,
+                             unsigned hw_cta_id, unsigned hw_warp_id,
+                             gpgpu_t *gpu, unsigned chiplet,
+                             unsigned mode, unsigned batch,
+                             bool functionalSimulationMode = false);
 const struct gpgpu_ptx_sim_info *ptx_sim_kernel_info(
     const class function_info *kernel);
+
+class VMM;
+class PMM;
+
+// central hub that connects the VMM to the PMM
+// also holds "global" settings
+class Hub {
+private:
+    uint64_t round_malloc_to; // round mallocs to this many bytes
+    uint64_t page_size; // base page size in bytes
+    uint64_t huge_page_size; // huge page size in number of base pages
+    uint64_t start_vaddr; // starting virtual address for allocations for each application, default is 0
+    std::map<uint64_t, VMM*> vmms;
+    PMM* pmm;
+    unsigned m_chiplet;
+    uint64_t m_chiplet_find_shift   = 0;
+    new_addr_type m_page_size_shift = 0;
+
+    mmu* m_mmu;
+    const memory_config * m_mem_config;
+public:
+    Hub(uint64_t rmt, uint64_t ps, uint64_t hps, uint64_t tp, unsigned chiplet, uint64_t sv, mmu* get_mmu);
+
+    uint64_t get_round_malloc_to() const { return round_malloc_to; }
+    uint64_t get_page_size() const { return page_size; }
+    uint64_t get_huge_page_size() const { return huge_page_size; }
+    uint64_t get_start_vaddr() const { return start_vaddr; }
+
+    PMM* get_pmm() { return pmm; }
+
+    void* allocate(uint64_t ID, uint64_t bytes);
+    void free(uint64_t ID, void* addr);
+    void print();
+
+    void* translate(uint64_t ID, void* vaddr, unsigned chiplet);
+    void mapping_pages(uint64_t vpn, unsigned int page_size, unsigned int chiplet);
+    bool check_mapping(uint64_t vpn);  // check whether a page is mapped to GPU memory
+
+    void modify_mapping(bool adding, bool promotion, uint64_t ID, uint64_t vaddr, uint64_t paddr,
+        unsigned chiplet, unsigned page_mode);
+
+    uint64_t get_malloc_num_pages(unsigned malloc_num);
+    unsigned get_malloc(uint64_t base_addr);
+    unsigned get_tot_malloc_num();
+    float get_malloc_remote_ratio(unsigned malloc_num);
+    unsigned get_map_chiplet(uint64_t vpn);
+    void copy_alloc_result(unsigned & total_result, std::vector<unsigned> & chiplet_result);
+};
+/*****************/
 
 /*!
  * This class functionally executes a kernel. It uses the basic data structures

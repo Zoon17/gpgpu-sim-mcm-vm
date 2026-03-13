@@ -1,19 +1,26 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Ali Bakhoda, Wilson W.L. Fung,
-// George L. Yuan, Jimmy Kwa
-// The University of British Columbia
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
+// Copyright (c) 2009-2021, Tor M. Aamodt, Ali Bakhoda, Wilson W.L. Fung,
+// George L. Yuan, Jimmy Kwa, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -52,6 +59,13 @@ typedef void *yyscan_t;
 #include "ptx_loader.h"
 #include "ptx_parser.h"
 #include "ptx_sim.h"
+
+#include <numeric>
+#include <unordered_set>
+#include <unordered_map>
+#include "../gpgpu-sim/mem_latency_stat.h"
+
+#define APP_ID 1  // Currently, it only supports single application...
 
 int g_debug_execution = 0;
 // Output debug information to file options
@@ -436,38 +450,36 @@ addr_t generic_to_local(unsigned smid, unsigned hwtid, addr_t addr) {
 
 addr_t generic_to_global(addr_t addr) { return addr; }
 
+void gpgpu_t::gpu_malloc_init() {
+    uint64_t DRAM_size  = 0;
+    if (m_mmu == nullptr) {
+        // Should not really happen
+        printf("GPU alloc tries to use MMU before initialized!!\n");
+        exit(0);
+    }
+    DRAM_size = m_mmu->get_mem_config()->DRAM_size;
+
+    assert(m_mmu->get_mem_config()->chiplet_num != 0);
+
+    m_gpu_alloc = new Hub(2097152, 4096, m_mmu->get_mem_config()->pages_in_chunk, DRAM_size / 4096, m_mmu->get_mem_config()->chiplet_num, m_dev_malloc, m_mmu);
+    printf("using DRAM size: %lu\n", DRAM_size);
+    printf("gpu_malloc starting pointer: %p\n", (void*)m_dev_malloc);
+}
+
 void *gpgpu_t::gpu_malloc(size_t size) {
-  unsigned long long result = m_dev_malloc;
-  if (g_debug_execution >= 3) {
-    printf(
-        "GPGPU-Sim PTX: allocating %zu bytes on GPU starting at address "
-        "0x%Lx\n",
-        size, m_dev_malloc);
-    fflush(stdout);
-  }
-  m_dev_malloc += size;
-  if (size % 256)
-    m_dev_malloc += (256 - size % 256);  // align to 256 byte boundaries
-  return (void *)result;
+    int appID = APP_ID;
+    void* ptr = m_gpu_alloc->allocate(appID, size);
+    printf("malloc returning pointer %p\n", ptr);
+    return ptr;
 }
 
 void *gpgpu_t::gpu_mallocarray(size_t size) {
-  unsigned long long result = m_dev_malloc;
-  if (g_debug_execution >= 3) {
-    printf(
-        "GPGPU-Sim PTX: allocating %zu bytes on GPU starting at address "
-        "0x%Lx\n",
-        size, m_dev_malloc);
-    fflush(stdout);
-  }
-  m_dev_malloc += size;
-  if (size % 256)
-    m_dev_malloc += (256 - size % 256);  // align to 256 byte boundaries
-  return (void *)result;
+    return gpu_malloc(size);
 }
 
 void gpgpu_t::memcpy_to_gpu(size_t dst_start_addr, const void *src,
-                            size_t count) {
+                            size_t count, int unused_appID) {
+  int appID = APP_ID;
   if (g_debug_execution >= 3) {
     printf(
         "GPGPU-Sim PTX: copying %zu bytes from CPU[0x%Lx] to GPU[0x%Lx] ... ",
@@ -475,8 +487,8 @@ void gpgpu_t::memcpy_to_gpu(size_t dst_start_addr, const void *src,
     fflush(stdout);
   }
   char *src_data = (char *)src;
-  for (unsigned n = 0; n < count; n++)
-    m_global_mem->write(dst_start_addr + n, 1, src_data + n, NULL, NULL);
+  for (uint64_t n = 0; n < count; n++)
+    m_global_mem->write(dst_start_addr + n, 1, src_data + n, NULL, NULL, appID);
 
   // Copy into the performance model.
   // extern gpgpu_sim* g_the_gpu;
@@ -487,15 +499,16 @@ void gpgpu_t::memcpy_to_gpu(size_t dst_start_addr, const void *src,
   }
 }
 
-void gpgpu_t::memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count) {
+void gpgpu_t::memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count, int unused_appID) {
+  int appID = APP_ID;
   if (g_debug_execution >= 3) {
     printf("GPGPU-Sim PTX: copying %zu bytes from GPU[0x%Lx] to CPU[0x%Lx] ...",
            count, (unsigned long long)src_start_addr, (unsigned long long)dst);
     fflush(stdout);
   }
   unsigned char *dst_data = (unsigned char *)dst;
-  for (unsigned n = 0; n < count; n++)
-    m_global_mem->read(src_start_addr + n, 1, dst_data + n);
+  for (uint64_t n = 0; n < count; n++)
+    m_global_mem->read(src_start_addr + n, 1, dst_data + n, appID);
 
   // Copy into the performance model.
   // extern gpgpu_sim* g_the_gpu;
@@ -506,16 +519,17 @@ void gpgpu_t::memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count) {
   }
 }
 
-void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
+void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count, int unused_appID) {
+  int appID = APP_ID;
   if (g_debug_execution >= 3) {
     printf("GPGPU-Sim PTX: copying %zu bytes from GPU[0x%Lx] to GPU[0x%Lx] ...",
            count, (unsigned long long)src, (unsigned long long)dst);
     fflush(stdout);
   }
-  for (unsigned n = 0; n < count; n++) {
+  for (uint64_t n = 0; n < count; n++) {
     unsigned char tmp;
-    m_global_mem->read(src + n, 1, &tmp);
-    m_global_mem->write(dst + n, 1, &tmp, NULL, NULL);
+    m_global_mem->read(src + n, 1, &tmp, appID);
+    m_global_mem->write(dst + n, 1, &tmp, NULL, NULL, appID);
   }
   if (g_debug_execution >= 3) {
     printf(" done.\n");
@@ -523,7 +537,8 @@ void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
   }
 }
 
-void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
+void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count, int unused_appID) {
+  int appID = APP_ID;
   if (g_debug_execution >= 3) {
     printf(
         "GPGPU-Sim PTX: setting %zu bytes of memory to 0x%x starting at "
@@ -532,8 +547,8 @@ void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
     fflush(stdout);
   }
   unsigned char c_value = (unsigned char)c;
-  for (unsigned n = 0; n < count; n++)
-    m_global_mem->write(dst_start_addr + n, 1, &c_value, NULL, NULL);
+  for (uint64_t n = 0; n < count; n++)
+    m_global_mem->write(dst_start_addr + n, 1, &c_value, NULL, NULL, appID);
   if (g_debug_execution >= 3) {
     printf(" done.\n");
     fflush(stdout);
@@ -557,7 +572,7 @@ std::string cuda_sim::ptx_get_insn_str(address_type pc) {
 #define STR_SIZE 255
     char buff[STR_SIZE];
     buff[STR_SIZE - 1] = '\0';
-    snprintf(buff, STR_SIZE, "<no instruction at address 0x%x>", pc);
+    snprintf(buff, STR_SIZE, "<no instruction at address 0x%llx>", pc);
     return std::string(buff);
   }
   function_info *finfo = f->second;
@@ -588,65 +603,119 @@ void ptx_instruction::set_fp_or_int_archop() {
       oprnd_type = INT_OP;
   }
 }
-void ptx_instruction::set_mul_div_or_other_archop() {
-  sp_op = OTHER_OP;
-  if ((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) &&
-      (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) &&
-      (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) &&
-      (m_opcode != CALL_OP)) {
-    if (get_type() == F32_TYPE || get_type() == F64_TYPE ||
-        get_type() == FF64_TYPE) {
-      switch (get_opcode()) {
-        case MUL_OP:
-        case MAD_OP:
-          sp_op = FP_MUL_OP;
-          break;
-        case DIV_OP:
-          sp_op = FP_DIV_OP;
-          break;
-        case LG2_OP:
-          sp_op = FP_LG_OP;
-          break;
-        case RSQRT_OP:
-        case SQRT_OP:
-          sp_op = FP_SQRT_OP;
-          break;
-        case RCP_OP:
-          sp_op = FP_DIV_OP;
-          break;
-        case SIN_OP:
-        case COS_OP:
-          sp_op = FP_SIN_OP;
-          break;
-        case EX2_OP:
-          sp_op = FP_EXP_OP;
-          break;
-        default:
-          if ((op == ALU_OP) || (op == TENSOR_CORE_OP)) sp_op = FP__OP;
-          break;
+
+void ptx_instruction::set_mul_div_or_other_archop(){
+  sp_op=OTHER_OP;
+  if((m_opcode != MEMBAR_OP) && (m_opcode != SSY_OP) && (m_opcode != BRA_OP) && (m_opcode != BAR_OP) && (m_opcode != EXIT_OP) && (m_opcode != NOP_OP) && (m_opcode != RETP_OP) && (m_opcode != RET_OP) && (m_opcode != CALLP_OP) && (m_opcode != CALL_OP)){
+    if(get_type() == F64_TYPE || get_type() == FF64_TYPE){
+         switch(get_opcode()){
+            case MUL_OP:
+            case MAD_OP:
+            case FMA_OP:
+                sp_op=DP_MUL_OP;
+               break;
+            case DIV_OP:
+            case REM_OP:
+                sp_op=DP_DIV_OP;
+               break;
+            case RCP_OP:
+                sp_op=DP_DIV_OP;
+               break;
+            case LG2_OP:
+                sp_op=FP_LG_OP;
+               break;
+            case RSQRT_OP:
+            case SQRT_OP:
+                sp_op=FP_SQRT_OP;
+               break;
+            case SIN_OP:
+            case COS_OP:
+                sp_op=FP_SIN_OP;
+               break;
+            case EX2_OP:
+                sp_op=FP_EXP_OP;
+               break;
+            case MMA_OP:
+                sp_op=TENSOR__OP;
+            break;
+            case TEX_OP:
+                sp_op=TEX__OP;
+            break;
+            default:
+               if((op==DP_OP) || (op==ALU_OP))
+                  sp_op=DP___OP;
+               break;
+         }
       }
-    } else {
-      switch (get_opcode()) {
-        case MUL24_OP:
-        case MAD24_OP:
-          sp_op = INT_MUL24_OP;
-          break;
-        case MUL_OP:
-        case MAD_OP:
-          if (get_type() == U32_TYPE || get_type() == S32_TYPE ||
-              get_type() == B32_TYPE)
-            sp_op = INT_MUL32_OP;
-          else
-            sp_op = INT_MUL_OP;
-          break;
-        case DIV_OP:
-          sp_op = INT_DIV_OP;
-          break;
-        default:
-          if ((op == ALU_OP)) sp_op = INT__OP;
-          break;
+      else if(get_type()==F16_TYPE || get_type()==F32_TYPE){
+         switch(get_opcode()){
+            case MUL_OP:
+            case MAD_OP:
+            case FMA_OP:
+                sp_op=FP_MUL_OP;
+               break;
+            case DIV_OP:
+            case REM_OP:
+                sp_op=FP_DIV_OP;
+               break;
+            case RCP_OP:
+                sp_op=FP_DIV_OP;
+               break;
+            case LG2_OP:
+                sp_op=FP_LG_OP;
+               break;
+            case RSQRT_OP:
+            case SQRT_OP:
+                sp_op=FP_SQRT_OP;
+               break;
+            case SIN_OP:
+            case COS_OP:
+                sp_op=FP_SIN_OP;
+               break;
+            case EX2_OP:
+                sp_op=FP_EXP_OP;
+               break;
+            case MMA_OP:
+                sp_op=TENSOR__OP;
+            break;
+            case TEX_OP:
+                sp_op=TEX__OP;
+            break;
+            default:
+               if((op==SP_OP) || (op==ALU_OP))
+                  sp_op=FP__OP;
+               break;
+         }
+      }else {
+         switch(get_opcode()){
+            case MUL24_OP:
+            case MAD24_OP:
+                sp_op=INT_MUL24_OP;
+            break;
+            case MUL_OP:
+            case MAD_OP:
+            case FMA_OP:
+               if(get_type()==U32_TYPE || get_type()==S32_TYPE || get_type()==B32_TYPE)
+                   sp_op=INT_MUL32_OP;
+               else
+                   sp_op=INT_MUL_OP;
+            break;
+            case DIV_OP:
+            case REM_OP:
+                sp_op=INT_DIV_OP;
+            break;
+            case MMA_OP:
+                sp_op=TENSOR__OP;
+            break;
+            case TEX_OP:
+                sp_op=TEX__OP;
+            break;
+            default:
+               if((op==INTP_OP) || (op==ALU_OP))
+                   sp_op=INT__OP;
+               break;
+         }
       }
-    }
   }
 }
 
@@ -880,6 +949,7 @@ void ptx_instruction::set_opcode_and_latency() {
     case MAD_OP:
     case MADC_OP:
     case MADP_OP:
+    case FMA_OP:
       // MAD latency
       switch (get_type()) {
         case F32_TYPE:
@@ -903,7 +973,18 @@ void ptx_instruction::set_opcode_and_latency() {
           break;
       }
       break;
+    case MUL24_OP: //MUL24 is performed on mul32 units (with additional instructions for bitmasking) on devices with compute capability >1.x
+      latency = int_latency[2]+1;
+      initiation_interval = int_init[2]+1;
+      op = INTP_OP;
+      break;
+    case MAD24_OP:
+      latency = int_latency[3]+1;
+      initiation_interval = int_init[3]+1;
+      op = INTP_OP;
+      break;
     case DIV_OP:
+    case REM_OP:
       // Floating point only
       op = SFU_OP;
       switch (get_type()) {
@@ -1036,6 +1117,8 @@ void ptx_instruction::pre_decode() {
     has_dst = (DST != 0);                            \
     break;
 #include "opcodes.def"
+
+
 #undef OP_DEF
 #undef OP_W_DEF
     default:
@@ -1304,7 +1387,7 @@ void function_info::add_param_data(unsigned argn,
       unsigned num_bits = 8 * args->m_nbytes;
       printf(
           "GPGPU-Sim PTX: deferred allocation of shared region for \"%s\" from "
-          "0x%x to 0x%x (shared memory space)\n",
+          "0x%llx to 0x%llx (shared memory space)\n",
           p->name().c_str(), m_symtab->get_shared_next(),
           m_symtab->get_shared_next() + num_bits / 8);
       fflush(stdout);
@@ -1385,7 +1468,7 @@ void function_info::finalize(memory_space *param_mem) {
     for (size_t idx = 0; idx < size; idx += word_size) {
       const char *pdata = reinterpret_cast<const char *>(param_value.pdata) +
                           idx;  // cast to char * for ptr arithmetic
-      param_mem->write(param_address + idx, word_size, pdata, NULL, NULL);
+      param_mem->write(param_address + idx, word_size, pdata, NULL, NULL, APP_ID);
     }
     unsigned offset = p.get_offset();
     assert(offset == param_address);
@@ -1423,7 +1506,7 @@ void function_info::param_to_shared(memory_space *shared_mem,
     type_info_key::type_decode(xtype, size, tmp);
 
     // Write to shared memory - offset + 0x10
-    shared_mem->write(offset + 0x10, size / 8, value.pdata, NULL, NULL);
+    shared_mem->write(offset + 0x10, size / 8, value.pdata, NULL, NULL, APP_ID);
   }
 }
 
@@ -1435,7 +1518,7 @@ void function_info::list_param(FILE *fout) const {
     std::string name = p.get_name();
     symbol *param = m_symtab->lookup(name.c_str());
     addr_t param_addr = param->get_address();
-    fprintf(fout, "%s: %#08x\n", name.c_str(), param_addr);
+    fprintf(fout, "%s: %#08llx\n", name.c_str(), param_addr);
   }
   fflush(fout);
 }
@@ -1463,9 +1546,13 @@ void function_info::ptx_jit_config(
   std::string filename_c(filename + "_c");
   snprintf(buff, 1024, "c++filt %s > %s", get_name().c_str(),
            filename_c.c_str());
-  assert(system(buff) != NULL);
+  assert(system(buff) != 0);
   FILE *fp = fopen(filename_c.c_str(), "r");
-  fgets(buff, 1024, fp);
+  char * ptr = fgets(buff, 1024, fp);
+  if(ptr == NULL ){
+          printf("can't read file %s \n", filename_c.c_str());
+          assert(0);
+  }
   fclose(fp);
   std::string fn(buff);
   size_t pos1, pos2;
@@ -1533,16 +1620,16 @@ void function_info::ptx_jit_config(
       }
 
       unsigned char *val = (unsigned char *)malloc(param_value.size);
-      param_mem->read(param_addr, param_value.size, (void *)val);
+      param_mem->read(param_addr, param_value.size, (void *)val, APP_ID);
       unsigned char *array_val = (unsigned char *)malloc(array_size);
       gpu->get_global_memory()->read(*(unsigned *)((void *)val), array_size,
-                                     (void *)array_val);
+                                     (void *)array_val, APP_ID);
       param_data.push_back(
           std::pair<size_t, unsigned char *>(array_size, array_val));
       paramIsPointer.push_back(true);
     } else {
       unsigned char *val = (unsigned char *)malloc(param_value.size);
-      param_mem->read(param_addr, param_value.size, (void *)val);
+      param_mem->read(param_addr, param_value.size, (void *)val, APP_ID);
       param_data.push_back(
           std::pair<size_t, unsigned char *>(param_value.size, val));
       paramIsPointer.push_back(false);
@@ -1774,6 +1861,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     op_classification = CLASSIFICATION;              \
     break;
 #include "opcodes.def"
+
+
 #undef OP_DEF
 #undef OP_W_DEF
           default:
@@ -2127,6 +2216,187 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
   return 1;
 }
 
+unsigned ptx_sim_init_thread(kernel_info_t &kernel,
+                             ptx_thread_info **thread_info, int sid,
+                             unsigned tid, unsigned threads_left,
+                             unsigned num_threads, core_t *core,
+                             unsigned hw_cta_id, unsigned hw_warp_id,
+                             gpgpu_t *gpu, unsigned chiplet, unsigned mode, unsigned batch,
+                             bool isInFunctionalSimulationMode) {
+  switch (mode) {
+    case CTA_DISTRIBUTED:
+    case CTA_KERNEL_WIDE:
+    case CTA_ALIGNMENT:
+    case CTA_ROW_BIND:
+    case CTA_COLUMN_BIND: {
+      std::list<ptx_thread_info *> &active_threads = kernel.active_threads();
+
+      static std::map<unsigned, memory_space *> shared_memory_lookup;
+      static std::map<unsigned, memory_space *> sstarr_memory_lookup;
+      static std::map<unsigned, ptx_cta_info *> ptx_cta_lookup;
+      static std::map<unsigned, ptx_warp_info *> ptx_warp_lookup;
+      static std::map<unsigned, std::map<unsigned, memory_space *> >
+          local_memory_lookup;
+
+      if (*thread_info != NULL) {
+        ptx_thread_info *thd = *thread_info;
+        assert(thd->is_done());
+        if (g_debug_execution == -1) {
+          dim3 ctaid = thd->get_ctaid();
+          dim3 t = thd->get_tid();
+          printf(
+              "GPGPU-Sim PTX simulator:  thread exiting ctaid=(%u,%u,%u) "
+              "tid=(%u,%u,%u) uid=%u\n",
+              ctaid.x, ctaid.y, ctaid.z, t.x, t.y, t.z, thd->get_uid());
+          fflush(stdout);
+        }
+        thd->m_cta_info->register_deleted_thread(thd);
+        delete thd;
+        *thread_info = NULL;
+      }
+
+      if (!active_threads.empty()) {
+        assert(active_threads.size() <= threads_left);
+        ptx_thread_info *thd = active_threads.front();
+        active_threads.pop_front();
+        *thread_info = thd;
+        thd->init(gpu, core, sid, hw_cta_id, hw_warp_id, tid,
+                  isInFunctionalSimulationMode);
+        return 1;
+      }
+
+      if (kernel.no_more_ctas_to_run()) {
+        return 0;  // finished!
+      }
+
+      if (threads_left < kernel.threads_per_cta()) {
+        return 0;
+      }
+
+      assert(kernel.have_more_chiplet_cta(chiplet, mode));
+
+      if (g_debug_execution == -1) {
+        printf("GPGPU-Sim PTX simulator:  STARTING THREAD ALLOCATION --> \n");
+        fflush(stdout);
+      }
+
+      // initializing new CTA
+      ptx_cta_info *cta_info = NULL;
+      memory_space *shared_mem = NULL;
+      memory_space *sstarr_mem = NULL;
+
+      unsigned cta_size = kernel.threads_per_cta();
+      unsigned max_cta_per_sm = num_threads / cta_size;  // e.g., 256 / 48 = 5
+      assert(max_cta_per_sm > 0);
+
+      // unsigned sm_idx = (tid/cta_size)*gpgpu_param_num_shaders + sid;
+      unsigned sm_idx =
+          hw_cta_id * gpu->gpgpu_ctx->func_sim->gpgpu_param_num_shaders + sid;
+
+      if (shared_memory_lookup.find(sm_idx) == shared_memory_lookup.end()) {
+        if (g_debug_execution >= 1) {
+          printf("  <CTA alloc> : sm_idx=%u sid=%u max_cta_per_sm=%u\n", sm_idx,
+                 sid, max_cta_per_sm);
+        }
+        char buf[512];
+        snprintf(buf, 512, "shared_%u", sid);
+        shared_mem = new memory_space_impl<16 * 1024>(buf, 4);
+        shared_memory_lookup[sm_idx] = shared_mem;
+        snprintf(buf, 512, "sstarr_%u", sid);
+        sstarr_mem = new memory_space_impl<16 * 1024>(buf, 4);
+        sstarr_memory_lookup[sm_idx] = sstarr_mem;
+        cta_info = new ptx_cta_info(sm_idx, gpu->gpgpu_ctx);
+        ptx_cta_lookup[sm_idx] = cta_info;
+      } else {
+        if (g_debug_execution >= 1) {
+          printf("  <CTA realloc> : sm_idx=%u sid=%u max_cta_per_sm=%u\n", sm_idx,
+                 sid, max_cta_per_sm);
+        }
+        shared_mem = shared_memory_lookup[sm_idx];
+        sstarr_mem = sstarr_memory_lookup[sm_idx];
+        cta_info = ptx_cta_lookup[sm_idx];
+        cta_info->check_cta_thread_status_and_reset();
+      }
+
+      std::map<unsigned, memory_space *> &local_mem_lookup =
+          local_memory_lookup[sid];
+      while (kernel.more_threads_in_cta()) {
+        dim3 ctaid3d = kernel.get_next_cta_id(chiplet);
+        unsigned new_tid = kernel.get_next_thread_id();
+        dim3 tid3d = kernel.get_next_thread_id_3d();
+        kernel.increment_thread_id();
+        new_tid += tid;
+        ptx_thread_info *thd = new ptx_thread_info(kernel);
+        ptx_warp_info *warp_info = NULL;
+        if (ptx_warp_lookup.find(hw_warp_id) == ptx_warp_lookup.end()) {
+          warp_info = new ptx_warp_info();
+          ptx_warp_lookup[hw_warp_id] = warp_info;
+        } else {
+          warp_info = ptx_warp_lookup[hw_warp_id];
+        }
+        thd->m_warp_info = warp_info;
+
+        memory_space *local_mem = NULL;
+        std::map<unsigned, memory_space *>::iterator l =
+            local_mem_lookup.find(new_tid);
+        if (l != local_mem_lookup.end()) {
+          local_mem = l->second;
+        } else {
+          char buf[512];
+          snprintf(buf, 512, "local_%u_%u", sid, new_tid);
+          local_mem = new memory_space_impl<32>(buf, 32);
+          local_mem_lookup[new_tid] = local_mem;
+        }
+        thd->set_info(kernel.entry());
+        thd->set_nctaid(kernel.get_grid_dim());
+        thd->set_ntid(kernel.get_cta_dim());
+        thd->set_ctaid(ctaid3d);
+        thd->set_tid(tid3d);
+        if (kernel.entry()->get_ptx_version().extensions())
+          thd->cpy_tid_to_reg(tid3d);
+        thd->set_valid();
+        thd->m_shared_mem = shared_mem;
+        thd->m_sstarr_mem = sstarr_mem;
+        function_info *finfo = thd->func_info();
+        symbol_table *st = finfo->get_symtab();
+        thd->func_info()->param_to_shared(thd->m_shared_mem, st);
+        thd->func_info()->param_to_shared(thd->m_sstarr_mem, st);
+        thd->m_cta_info = cta_info;
+        cta_info->add_thread(thd);
+        thd->m_local_mem = local_mem;
+        if (g_debug_execution == -1) {
+          printf(
+              "GPGPU-Sim PTX simulator:  allocating thread ctaid=(%u,%u,%u) "
+              "tid=(%u,%u,%u) @ 0x%Lx\n",
+              ctaid3d.x, ctaid3d.y, ctaid3d.z, tid3d.x, tid3d.y, tid3d.z,
+              (unsigned long long)thd);
+          fflush(stdout);
+        }
+        active_threads.push_back(thd);
+      }
+      if (g_debug_execution == -1) {
+        printf("GPGPU-Sim PTX simulator:  <-- FINISHING THREAD ALLOCATION\n");
+        fflush(stdout);
+      }
+
+      kernel.increment_cta_id();
+      kernel.increment_cta_id(chiplet, mode, batch);
+
+      assert(active_threads.size() <= threads_left);
+      *thread_info = active_threads.front();
+      (*thread_info)
+          ->init(gpu, core, sid, hw_cta_id, hw_warp_id, tid,
+                 isInFunctionalSimulationMode);
+      active_threads.pop_front();
+      return 1;
+      break;
+    }
+    default:
+      assert(0 && "Should not reach here!");
+      break;
+  }
+}
+
 size_t get_kernel_code_size(class function_info *entry) {
   return entry->get_function_size();
 }
@@ -2259,9 +2529,9 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
       mem_name, count, (to ? " to " : "from"), sym_name.c_str(), offset, dst);
   for (unsigned n = 0; n < count; n++) {
     if (to)
-      mem->write(dst + n, 1, ((char *)src) + n, NULL, NULL);
+      mem->write(dst + n, 1, ((char *)src) + n, NULL, NULL, APP_ID);
     else
-      mem->read(dst + n, 1, ((char *)src) + n);
+      mem->read(dst + n, 1, ((char *)src) + n, APP_ID);
   }
   fflush(stdout);
 }
@@ -2308,7 +2578,7 @@ void cuda_sim::read_sim_environment_variables() {
         "%s\n",
         dbg_pc);
     fflush(stdout);
-    sscanf(dbg_pc, "%d", &g_debug_pc);
+    sscanf(dbg_pc, "%llu", &g_debug_pc);
   }
 
 #if CUDART_VERSION > 1010
@@ -2380,6 +2650,7 @@ parameter which holds the data for the CUDA kernel to be executed
 !*/
 void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
                                             bool openCL) {
+  assert(0);  // not used
   printf(
       "GPGPU-Sim: Performing Functional Simulation, executing kernel %s...\n",
       kernel.name().c_str());
@@ -2593,6 +2864,7 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
   regval.u64 = 123;
 
   unsigned ctaid = m_kernel->get_next_cta_id_single();
+  assert(0);  // not used
   if (m_gpu->checkpoint_option == 1 &&
       (m_kernel->get_uid() == m_gpu->checkpoint_kernel) &&
       (ctaid_cp >= m_gpu->checkpoint_CTA) &&
@@ -2823,4 +3095,961 @@ void functionalCoreSim::warp_exit(unsigned warp_id) {
       delete m_thread[i];
     }
   }
+}
+
+
+#define max_uint64 (~uint64_t{0})
+
+// interface for physical memory manager
+class Abstract_PMM {
+public:
+    void allocate(uint64_t ID, uint64_t first_page_num, uint64_t num_pages);
+    void free(uint64_t ID, uint64_t first_page_num, uint64_t num_pages);
+    uint64_t translate(uint64_t ID, uint64_t page_num);
+    void print();
+};
+
+// interface for virtual memory manager
+class Abstract_VMM {
+public:
+    void* allocate(uint64_t bytes);
+    void free(void* a);
+    void print();
+
+    void allocate_base_rr(uint64_t base_vpn, uint64_t num_pages);
+    void allocate_kernel_wide(uint64_t base_vpn, uint64_t num_pages);
+    void allocate_advanced_kernel_wide(uint64_t base_vpn, uint64_t num_pages, uint64_t law_byte);
+    void allocate_stride_based(uint64_t base_vpn, uint64_t num_pages, unsigned row_width);
+    void allocate_column_based(uint64_t base_vpn, uint64_t num_pages, unsigned row_width);
+};
+
+class PMM;
+class VMM;
+
+
+void Hub::modify_mapping(bool adding, bool promotion, uint64_t old_ID, uint64_t vaddr, uint64_t paddr,
+  unsigned chiplet, unsigned page_mode) {
+    uint64_t ID = APP_ID;
+    if (adding) {
+        if (promotion) {
+            assert(0 && "this never happen !!\n");
+        } else {
+            // mapping being added from base page at vaddr to paddr
+            m_mmu->allocate_PA((new_addr_type)vaddr, (new_addr_type)paddr, ID, chiplet, page_mode);
+        }
+    }
+}
+
+
+class PMM : public Abstract_PMM {
+    typedef struct Log_Info {
+        uint64_t ID;
+        Hub* hub;
+        unsigned m_chiplet;
+
+        Log_Info(uint64_t _ID, Hub* h) {
+          m_chiplet = 0;
+          ID = _ID;
+          hub = h;
+        }
+
+        Log_Info(uint64_t _ID, Hub* h, unsigned chiplet) :
+            m_chiplet(chiplet) {
+            ID = _ID;
+            hub = h;
+        }
+    } Log_Info;
+
+    class Virtual_Chunk;
+    class Shared_Chunk;
+
+    class Virtual_Chunk {
+        uint64_t paddr1(Log_Info info) { // use if reservation / huge page
+            // chunk_num is physical frame number of logical chunk
+            return (chunk_num * info.hub->get_huge_page_size()) * info.hub->get_page_size();
+        }
+        uint64_t vaddr1(Log_Info info) {
+            // vaddr is logical chunk number with page offset
+            return vaddr;
+        }
+
+    public:
+        const uint64_t vaddr;
+        uint64_t unused_pages; // 0 if full
+        bool has_pte;
+        uint64_t chunk_num; // used if chunk is reserved or huge page
+        Virtual_Chunk(uint64_t huge_page_size, uint64_t va, uint64_t cn = max_uint64) : vaddr(va) {
+            unused_pages = huge_page_size;
+            chunk_num = cn;
+        }
+        bool full() {
+            return unused_pages == 0;
+        }
+        bool fragmented() {
+            return chunk_num == max_uint64;
+        }
+        uint64_t getPPN(Log_Info info) {
+            return paddr1(info);
+        }
+
+        void mark_page() {
+                   assert(!fragmented() && "allocation error");
+            assert(!full() && "allocation error");
+            --unused_pages;
+            has_pte = false;
+        }
+
+        void add_page(Log_Info info, unsigned page_mode) {
+            has_pte = true;
+            info.hub->modify_mapping(true, false, info.ID, vaddr1(info), paddr1(info),
+              info.m_chiplet, page_mode);
+        }
+
+        void remove_page(Log_Info info, unsigned chiplet, unsigned page_mode) {
+            ++unused_pages;
+            if (has_pte) {
+              uint64_t paddr = paddr1(info);
+              info.hub->modify_mapping(false, false, info.ID, vaddr1(info), paddr,
+                chiplet, page_mode);
+            }
+        }
+    };
+
+    class Vspace_Data {
+    public:
+        std::unordered_map<uint64_t,Virtual_Chunk*> virt_to_phys;
+        std::unordered_set<Virtual_Chunk*> reserved_chunks;
+        std::unordered_set<Shared_Chunk*> fragmented_chunks;
+        Vspace_Data() : virt_to_phys(), reserved_chunks(), fragmented_chunks() {}
+    };
+
+    Hub* hub;
+    uint64_t huge_page_size;
+    uint64_t max_chunks;
+    std::unordered_map<uint64_t,Vspace_Data*> ID_to_data;
+    std::vector<uint64_t> free_chunks;
+    uint64_t pages_allocated, pages_freed;
+
+    std::vector<uint64_t> * chiplet_free_chunks;
+    unsigned m_chiplet;
+
+    std::vector<uint64_t> * chiplet_free_large_chunks;
+
+    typedef std::vector<std::deque<uint64_t> *> chiplet_reserved_chunks;
+    std::unordered_map<unsigned, chiplet_reserved_chunks *> mem_reserved_chunks;
+
+    unsigned total_pages_alloc = 0;
+    std::vector<unsigned> chiplet_page_alloc;
+    std::unordered_map<new_addr_type, unsigned> chiplet_page_alloc_map;
+    std::unordered_map<unsigned, std::vector<unsigned>> malloc_chiplet_page_alloc;
+
+    const memory_config * m_mem_config;
+
+    struct page_info {
+        new_addr_type phys;
+        unsigned chiplet;
+        page_info(new_addr_type phys_in, unsigned chiplet_in) :
+        phys(phys_in), chiplet(chiplet_in){}
+    };
+
+public:
+    PMM(Hub* h, uint64_t hps, uint64_t total_pages, unsigned chiplet, const memory_config * config) :
+        free_chunks(total_pages / hps), ID_to_data(), m_mem_config(config) {
+        hub = h;
+        huge_page_size = hps;
+        max_chunks = total_pages / huge_page_size;
+        std::iota(free_chunks.rbegin(), free_chunks.rend(), 0);
+        pages_allocated = 0; pages_freed = 0;
+
+        m_chiplet = chiplet;
+        chiplet_free_chunks = new std::vector<uint64_t> [chiplet];
+        for (uint64_t i = 0; i < max_chunks; i++) {
+            chiplet_free_chunks[i/(max_chunks/chiplet)].push_back(i);
+        }
+
+        for (auto i = 0; i < chiplet; i++) {
+            std::reverse(chiplet_free_chunks[i].begin(), chiplet_free_chunks[i].end());
+            assert(!chiplet_free_chunks[i].empty());
+            printf("Chiplet %3d physical address address range: %10lx ~ %10lx\n", i, chiplet_free_chunks[i].back(), chiplet_free_chunks[i].front());
+        }
+
+        uint64_t large_chunk_num = total_pages / static_cast<uint64_t>(512);  // 512 * 4KB = 2MB
+        chiplet_free_large_chunks = new std::vector<uint64_t> [chiplet];
+        for (uint64_t i = 0; i < large_chunk_num; i++){
+            chiplet_free_large_chunks[i/(large_chunk_num/chiplet)].push_back(i);
+        }
+
+        for (auto i = 0; i < chiplet; i++) {
+            std::reverse(chiplet_free_large_chunks[i].begin(), chiplet_free_large_chunks[i].end());
+            assert(!chiplet_free_large_chunks[i].empty());
+            printf("Chiplet %3d large chunk physical address range: %10lx ~ %10lx\n", i, chiplet_free_large_chunks[i].back(), chiplet_free_large_chunks[i].front());
+        }
+
+        mem_reserved_chunks.clear();
+        for (unsigned i = 1; i <= 512; i = i * 2) {
+            auto * multi_chunk = new chiplet_reserved_chunks;
+            for (auto c = 0; c < chiplet; c++){
+                auto * empty_queue = new std::deque<uint64_t>;
+                multi_chunk->push_back(empty_queue);
+            }
+            mem_reserved_chunks.insert(std::pair<unsigned, chiplet_reserved_chunks *>
+                                           (i, multi_chunk));
+        }
+
+        chiplet_page_alloc.assign(chiplet, 0);
+        chiplet_page_alloc_map.clear();
+        for (unsigned i = 0; i < 100; i++) {
+            malloc_chiplet_page_alloc[i].assign(chiplet, 0);
+        }
+    }
+
+    void copy_alloc_result(unsigned & total_result, std::vector<unsigned> & chiplet_result) {
+      total_result = total_pages_alloc;
+      chiplet_result.assign(chiplet_page_alloc.begin(), chiplet_page_alloc.begin()+m_chiplet);
+    }
+
+    uint64_t translate(uint64_t ID, uint64_t vpn) {
+        Vspace_Data* data = ID_to_data[ID];
+        if (data == nullptr) {
+            ID_to_data.erase(ID);
+            return max_uint64;
+        }
+        const uint64_t vcn = vpn / huge_page_size; // virtual chunk number
+        Virtual_Chunk* chunk = data->virt_to_phys[vcn];
+        if (chunk == nullptr) {  // not allocated chunk
+            data->virt_to_phys.erase(vcn);
+            return max_uint64;
+        }
+
+        // chiplet ID is not important for getting PPN
+        Log_Info info = Log_Info(ID, hub);
+        return chunk->getPPN(info);
+    }
+
+    void allocate(uint64_t ID, uint64_t first_vpn, uint64_t num_pages, unsigned chiplet, unsigned page_mode) {
+        if (ID_to_data[ID] == nullptr) ID_to_data[ID] = new Vspace_Data();
+        Vspace_Data* data = ID_to_data[ID];
+        for (uint64_t vpn = first_vpn; vpn < first_vpn + num_pages; ++vpn) {
+            assert(huge_page_size == 1);  // set page allocate chunk unit to 4KB base page
+            const uint64_t vcn = vpn / huge_page_size; // same as vpn, 4KB base chunk, virtual chunk number
+            const uint64_t hps = huge_page_size;  // same as 1
+            const uint64_t virtual_offset = vpn % huge_page_size;
+            assert(hps == 1);
+
+            Virtual_Chunk* chunk = data->virt_to_phys[vcn];
+            Log_Info info = Log_Info(ID, hub, chiplet);
+            if (chunk == nullptr) {
+                std::deque<uint64_t> * get_queue = mem_reserved_chunks.at(page_mode)->at(chiplet);
+                assert(get_queue != nullptr);
+                if (!get_queue->empty()){
+                    uint64_t get_page = get_queue->back();
+                    get_queue->pop_back();
+                    chunk = new Virtual_Chunk(hps, vcn * hps * hub->get_page_size(), get_page);
+                    //chiplet_free_chunks[chiplet].pop_back();
+                    //data->reserved_chunks.insert(chunk);
+
+                    // page allocation tracking
+                    total_pages_alloc++;
+                    chiplet_page_alloc[chiplet] += 1;
+                    if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+                        unsigned malloc_num = hub->get_malloc(vpn << 12);
+                        malloc_chiplet_page_alloc[malloc_num][chiplet] += 1;
+                    }
+                    chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, chiplet));  // store key:chiplet pair
+                } else {
+                    if (!chiplet_free_large_chunks[chiplet].empty()){
+                        uint64_t get_chunk = chiplet_free_large_chunks[chiplet].back();
+                        chiplet_free_large_chunks[chiplet].pop_back();
+
+                        for (unsigned  i = 0; i < 512; i++){
+                          uint64_t get_sub_page = chiplet_free_chunks[chiplet].back();
+                          chiplet_free_chunks[chiplet].pop_back();
+
+                          uint64_t chunk_number = (uint64_t)(get_sub_page / static_cast<uint64_t>(512));
+                          assert(get_chunk == chunk_number);
+
+                          get_queue->push_front(get_sub_page);
+                        }
+
+                        uint64_t get_page = get_queue->back();
+                        get_queue->pop_back();
+                        chunk = new Virtual_Chunk(hps, vcn * hps * hub->get_page_size(), get_page);
+                        //chiplet_free_chunks[chiplet].pop_back();
+                        //data->reserved_chunks.insert(chunk);
+
+                        // page allocation tracking
+                        total_pages_alloc++;
+                        chiplet_page_alloc[chiplet] += 1;
+                        if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+                            unsigned malloc_num = hub->get_malloc(vpn << 12);
+                            malloc_chiplet_page_alloc[malloc_num][chiplet] += 1;
+                        }
+                        chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, chiplet));  //  store key:chiplet pair
+                    } else {
+                        assert(0 && "Memory Over!!, this can be handle with memory oversubscription");
+                    }
+                }
+                data->virt_to_phys[vcn] = chunk;
+                chunk->mark_page();
+            }
+            if (vpn == first_vpn) {
+                assert(virtual_offset == 0);
+                chunk->add_page(info, page_mode);
+            }
+        }
+        pages_allocated += num_pages;
+    }
+
+    unsigned get_alloc_chiplet(unsigned malloc_num, unsigned origin_chiplet) {
+        std::vector<unsigned> & get_alloc_vector = malloc_chiplet_page_alloc[malloc_num];
+        unsigned mapped_pages = 0;
+        for (unsigned c = 0; c < m_chiplet; c++) {
+            mapped_pages += get_alloc_vector.at(c);
+        }
+        uint64_t total_pages = hub->get_malloc_num_pages(malloc_num);
+
+        float map_ratio = static_cast<float>(mapped_pages) / static_cast<float>(total_pages);
+        if (map_ratio < m_mem_config->trigger_balancing) return origin_chiplet;
+
+        // check remote access ratio
+        float remote_ratio = hub->get_malloc_remote_ratio(malloc_num);
+        if (remote_ratio < m_mem_config->remote_thres) return origin_chiplet;
+
+        // get max allocated page
+        unsigned max_page = 0;
+        unsigned min_page = UINT32_MAX;
+        unsigned alloc_chiplet = -1;
+
+        for (unsigned i = 0; i < m_chiplet; i++) {
+            if (max_page < get_alloc_vector[i]) max_page = get_alloc_vector[i];
+            if (min_page > get_alloc_vector[i]) {
+                min_page = get_alloc_vector[i];
+                alloc_chiplet = i;
+            }
+        }
+
+        if (max_page == 0) return origin_chiplet;  // prevent arithmetic error
+        assert(alloc_chiplet != -1);
+
+        // calculate balance score
+        float sum_score = 0;
+        for (unsigned i = 0; i < m_chiplet; i++){
+            unsigned alloc_page = get_alloc_vector[i];
+            sum_score += static_cast<float>(alloc_page) / static_cast<float>(max_page);
+        }
+        float balance_score = sum_score / static_cast<float>(m_chiplet);
+        assert(balance_score <= static_cast<float>(1));
+
+        if (balance_score < m_mem_config->balancing_thres) return alloc_chiplet;
+        else return origin_chiplet;
+    }
+
+    void free(uint64_t ID, uint64_t vpn, uint64_t num_pages, unsigned page_mode, unsigned chiplet) {
+        Vspace_Data* data = ID_to_data[ID];
+        assert(num_pages == 1);
+        assert(huge_page_size == 1);
+        const uint64_t vcn = vpn / huge_page_size;
+        Log_Info info = Log_Info(ID, hub, chiplet);
+        Virtual_Chunk* vchunk = data->virt_to_phys[vcn];
+        assert(vchunk != nullptr);
+        vchunk->remove_page(info, chiplet, page_mode);
+
+        // Actually we have to handle freed pages
+        std::deque<uint64_t> * get_queue = mem_reserved_chunks.at(page_mode)->at(chiplet);
+        get_queue->push_front(vchunk->chunk_num);
+
+        total_pages_alloc--;
+        chiplet_page_alloc[chiplet] -= 1;
+        chiplet_page_alloc_map.erase(vpn);
+        if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+            unsigned malloc_num = hub->get_malloc(vpn << 12);
+            malloc_chiplet_page_alloc[malloc_num][chiplet] -= 1;
+        }
+        data->virt_to_phys.erase(vcn);
+        //data->reserved_chunks.erase(vchunk);
+        delete vchunk;
+        pages_freed += num_pages;
+    }
+};
+
+
+class VMM : public Abstract_VMM {
+    class Range {
+    public:
+        uint64_t start, end;
+
+        Range() {}
+        Range(uint64_t s, uint64_t e) {
+            start = s;
+            end = e;
+        }
+        uint64_t size() const {
+            return end-start;
+        }
+        bool contains(uint64_t num) const {
+            return (start <= num) && (num < end);
+        }
+    };
+    struct RangeStartCompare {
+        bool operator()(const Range& a, const Range& b) const {
+            return a.start < b.start;
+        }
+    };
+    struct RangeSizeCompare {
+        bool operator()(const Range& a, const Range& b) const {
+            if (a.size() != b.size()) {
+                return a.size() < b.size();
+            } else {
+                return a.start < b.start;
+            }
+        }
+    };
+
+    uint64_t end_addr;
+    uint64_t in_use;
+    uint64_t ID;
+    Hub* hub;
+    std::set<Range, RangeStartCompare> used_ranges;
+    std::set<Range, RangeSizeCompare> free_ranges;
+
+    const memory_config* m_config;
+    mmu* m_mmu;
+
+    // record per-malloc virtual address range
+    typedef std::pair<uint64_t, uint64_t> virtual_range;
+    unsigned malloc_cnt;
+    std::list<virtual_range> malloc_list;
+    std::unordered_map<unsigned, uint64_t> malloc_num_pages;
+    uint64_t max_byte = 0;
+
+    bool sched_list_setup = false;
+    std::list<uint64_t> * data_sched_list;
+    std::list<uint64_t> * data_batch_list;
+
+public:
+    VMM(Hub* h, uint64_t _ID, const memory_config* config, mmu* get_mmu) : used_ranges(), free_ranges() {
+        hub = h;
+        end_addr = hub->get_start_vaddr();
+        in_use = 0;
+        ID = _ID;
+
+        m_config = config;
+        m_mmu = get_mmu;
+
+        // record per-malloc virtual address range
+        malloc_cnt = 0;
+        malloc_list.clear();
+        malloc_num_pages.clear();
+
+        sched_list_setup = false;
+        data_sched_list  = new std::list<uint64_t>;
+        data_batch_list  = new std::list<uint64_t>;
+    }
+
+    unsigned get_malloc(uint64_t base_addr) {
+        int index = 0;
+            for (auto it = malloc_list.begin(); it != malloc_list.end(); ++it) {
+                uint64_t start_addr = it->first;
+                uint64_t end_addr   = it->second;
+                if (base_addr >= start_addr && base_addr <= end_addr) {
+                    return index;
+                }
+                index++;
+            }
+            return -1;
+    }
+
+    uint64_t get_malloc_num_pages(unsigned malloc_num) {
+        return malloc_num_pages.at(malloc_num);
+    }
+
+    unsigned get_tot_malloc_num() {
+        return malloc_cnt;
+    }
+
+    void print() {
+        fprintf(stderr, "Total size of data structures (accumulated) = %lu MB\n", (in_use / static_cast<uint64_t>(1024 * 1024)));
+    }
+
+    void set_up_sched_list(){
+        unsigned sched_num = m_config->data_sched_map->size();
+        for (unsigned i = 0; i < sched_num; i++){
+            uint64_t sched = m_config->data_sched_map->at(i);
+            data_sched_list->push_back(sched);
+        }
+
+        unsigned batch_num = m_config->data_batch_map->size();
+        for (unsigned i = 0; i < batch_num; i++){
+            uint64_t batch = m_config->data_batch_map->at(i);
+            data_batch_list->push_back(batch);
+        }
+
+        printf("Copy data sched, the list is: [");
+        for (std::list<uint64_t>::iterator itr = data_sched_list->begin(); itr != data_sched_list->end(); ++itr) {
+            printf("%lu, ",*itr);
+        }
+        printf("]\n");
+
+        printf("Copy data batch, the list is: [");
+        for (std::list<uint64_t>::iterator itr = data_batch_list->begin(); itr != data_batch_list->end(); ++itr) {
+            printf("%lu, ",*itr);
+        }
+        printf("]\n");
+    }
+
+    void* allocate(uint64_t bytes) {
+        if (m_config->static_data_multi_enable && !sched_list_setup){
+            set_up_sched_list();
+            sched_list_setup = true;
+        }
+
+        if (bytes == 0) return (void*)end_addr;
+
+        uint64_t law_byte = bytes;
+        double law_byte_print = static_cast<double>(law_byte) / static_cast<double>(1024 * 1024);
+        fprintf(stderr, "Memory allocation (MB) =  %10.3f\n", law_byte_print);
+
+        if ((hub->get_round_malloc_to() != 0) && (bytes % hub->get_round_malloc_to() != 0)) {
+            bytes += hub->get_round_malloc_to() - (bytes % hub->get_round_malloc_to());
+        }
+
+        // record per-allocation virtual address range
+        malloc_list.emplace_back(end_addr, end_addr + bytes - 1);
+        if (law_byte > max_byte) max_byte = law_byte;
+        fprintf(stderr, "Virtual address range = %lx ~ %lx\n", end_addr, end_addr + bytes - 1);
+
+        in_use += bytes;
+
+        Range allocated_range;
+        // try to allocate out of existing free address space
+        auto it = free_ranges.upper_bound(Range(0, bytes-1));
+        if (it != free_ranges.end()) {
+            assert(0 && "Never reach here! It currently doesn't support memory oversubscription");
+            const Range& r = *it;
+            // add unused space back to free pool
+            if (r.size() != bytes) {
+                Range new_r = r;
+                new_r.start += bytes;
+                free_ranges.insert(new_r);
+            }
+            allocated_range = Range(r.start, r.start + bytes);
+            free_ranges.erase(it);
+        } else {
+            // fall back to using new virtual addresses
+            allocated_range = Range(end_addr, end_addr + bytes);
+            end_addr += bytes;
+        }
+        it = used_ranges.insert(allocated_range).first;
+        // request physical backings for new pages
+
+        uint64_t base_vpn  = allocated_range.start / (uint64_t)hub->get_page_size();
+        uint64_t num_pages = (allocated_range.end - allocated_range.start) / (uint64_t)hub->get_page_size();
+        malloc_num_pages.insert(std::pair<unsigned, uint64_t>(malloc_cnt, num_pages));
+        malloc_cnt++;
+
+        // data mapping
+        unsigned sched_mode;
+        unsigned sched_size;
+        if (m_config->static_data_multi_enable) {
+            sched_mode = static_cast<unsigned>(data_sched_list->front());
+            sched_size = static_cast<unsigned>(data_batch_list->front());
+            data_sched_list->pop_front();
+            data_batch_list->pop_front();
+            fprintf(stderr, "data sched mode = %5d\n", sched_mode);
+            fprintf(stderr, "data batch mode = %5d\n", sched_size);
+        } else {
+            sched_mode = m_config->mcm_data_schedule;
+            sched_size = m_config->data_batch;
+        }
+
+        switch (sched_mode) {
+            case PAGE_BASE_RR:
+                allocate_base_rr(base_vpn, num_pages);
+                break;
+            case PAGE_FIRST_TOUCH:
+                break;
+            case PAGE_KERNEL_WIDE:
+            case PAGE_ROW:
+                allocate_kernel_wide(base_vpn, num_pages);
+                break;
+            case PAGE_ADVANCED_KERNEL_WIDE:
+                allocate_advanced_kernel_wide(base_vpn, num_pages, law_byte);
+                break;
+            case PAGE_STRIDE:
+                allocate_stride_based(base_vpn, num_pages, sched_size);
+                break;
+            case PAGE_COLUMN:
+                allocate_column_based(base_vpn, num_pages, sched_size);
+                break;
+            default:
+                assert(0);  // never happen
+        }
+        return (void*)allocated_range.start;
+    }
+
+    // simply interleave pages across chiplet in a round-robin manner
+    void allocate_base_rr(uint64_t base_vpn, uint64_t num_pages) {
+        unsigned chiplet_id = 0;
+        uint64_t page_mode  = (uint64_t)m_config->set_page_size;
+
+        uint64_t tot_alloc_count = 0;
+        for (uint64_t i = 0; i < num_pages; i+=(uint64_t)page_mode) {
+            hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id, static_cast<unsigned>(page_mode));
+            for (uint64_t page = 0; page < (uint64_t)page_mode; page++){
+                uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+                tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
+                shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                tot_alloc_count++;
+            }
+            chiplet_id++;
+            if (chiplet_id >= m_mmu->get_mem_config()->chiplet_num) {
+                chiplet_id = 0;
+            }
+        }
+    }
+
+    void allocate_kernel_wide(uint64_t base_vpn, uint64_t num_pages){
+        unsigned chiplet_id = 0;
+        uint64_t page_mode  = (uint64_t)m_config->set_page_size;
+        unsigned tot_chiplet_num = m_config->chiplet_num;
+
+        uint64_t chunk_num = num_pages / (uint64_t)page_mode;
+        float divide = static_cast<float>(chunk_num) / static_cast<float>(tot_chiplet_num);
+        uint64_t chunk_per_chiplet = (uint64_t)(floor(divide));
+
+        uint64_t tot_alloc_count = 0;
+
+        // contiguous allocation
+        uint64_t contiguous_max = (uint64_t)chunk_per_chiplet * static_cast<uint64_t>(tot_chiplet_num) * (uint64_t)page_mode;
+        uint64_t page_per_chiplet = (uint64_t)chunk_per_chiplet * (uint64_t)page_mode;
+        assert(contiguous_max <= num_pages);
+        fprintf(stderr, "Row-based, contiguous_max = %lu\n", contiguous_max);
+
+        for (uint64_t i = 0; i < contiguous_max; i += page_per_chiplet) {
+            for (uint64_t c = 0; c < chunk_per_chiplet; c++){
+                hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id, static_cast<unsigned>(page_mode));
+                for (uint64_t page = 0; page < (uint64_t)page_mode; page++){
+                    assert(tot_alloc_count < num_pages);
+                    assert(chiplet_id < tot_chiplet_num);
+                    uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+
+                    tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
+                    shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                    tot_alloc_count++;
+                }
+            }
+            chiplet_id++;
+        }
+
+        // allocate remained pages in a round-robin manner
+        chiplet_id = 0;  // reset chiplet id
+        assert((tot_alloc_count % (uint64_t)page_mode) == 0);
+        uint64_t current_alloc = tot_alloc_count;
+
+        for (uint64_t i = current_alloc; i < num_pages; i+=(uint64_t)page_mode) {
+            assert(chiplet_id < tot_chiplet_num);
+            hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id, static_cast<unsigned>(page_mode));
+            for (uint64_t page = 0; page < (uint64_t)page_mode; page++){
+                uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+
+                tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
+                shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                tot_alloc_count++;
+            }
+            chiplet_id++;
+        }
+        assert(tot_alloc_count == num_pages);
+    }
+
+    void allocate_advanced_kernel_wide(uint64_t base_vpn, uint64_t num_pages, uint64_t law_byte){
+        unsigned chiplet_id = 0;
+        unsigned tot_chiplet_num = m_config->chiplet_num;
+        uint64_t byte_per_chip = law_byte / tot_chiplet_num;
+        uint64_t page_per_chip = byte_per_chip / static_cast<uint64_t>(1024 * 4);
+        uint64_t page_mode;
+        if (page_per_chip < PAGE_2M) {
+            page_mode = PAGE_64K;
+        } else {
+            page_mode = PAGE_2M;
+        }
+
+        uint64_t chunk_num = num_pages / (uint64_t) page_mode;
+        float divide = static_cast<float>(chunk_num) / static_cast<float>(tot_chiplet_num);
+        uint64_t chunk_per_chiplet = (uint64_t) (floor(divide));
+
+        uint64_t tot_alloc_count = 0;
+
+        // contiguous allocation
+        uint64_t contiguous_max = (uint64_t) chunk_per_chiplet * static_cast<uint64_t>(tot_chiplet_num) * (uint64_t)
+                                  page_mode;
+        uint64_t page_per_chiplet = (uint64_t) chunk_per_chiplet * (uint64_t) page_mode;
+        assert(contiguous_max <= num_pages);
+        fprintf(stderr, "Row-based, contiguous_max = %lu\n", contiguous_max);
+
+        for (uint64_t i = 0; i < contiguous_max; i += page_per_chiplet) {
+            for (uint64_t c = 0; c < chunk_per_chiplet; c++) {
+                hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id,
+                                         static_cast<unsigned>(page_mode));
+                for (uint64_t page = 0; page < (uint64_t) page_mode; page++) {
+                    assert(tot_alloc_count < num_pages);
+                    assert(chiplet_id < tot_chiplet_num);
+                    uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+
+                    tlb_tag_array *shared_tlb = m_mmu->get_L2_tlb();
+                    shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                    tot_alloc_count++;
+                }
+            }
+            chiplet_id++;
+        }
+
+        // allocate remained pages in a round-robin manner
+        chiplet_id = 0; // reset chiplet id
+        assert((tot_alloc_count % (uint64_t)page_mode) == 0);
+        uint64_t current_alloc = tot_alloc_count;
+
+        for (uint64_t i = current_alloc; i < num_pages; i += (uint64_t) page_mode) {
+            assert(chiplet_id < tot_chiplet_num);
+            hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id,
+                                     static_cast<unsigned>(page_mode));
+            for (uint64_t page = 0; page < (uint64_t) page_mode; page++) {
+                uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+
+                tlb_tag_array *shared_tlb = m_mmu->get_L2_tlb();
+                shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                tot_alloc_count++;
+            }
+            chiplet_id++;
+        }
+        assert(tot_alloc_count == num_pages);
+    }
+
+    void allocate_stride_based(uint64_t base_vpn, uint64_t num_pages, unsigned stride) {
+        assert(stride != 0);
+        unsigned chiplet_id = 0;
+        uint64_t page_mode  = (uint64_t)m_config->set_page_size;
+        unsigned tot_chiplet_num = m_config->chiplet_num;
+
+        // calculate interleave size
+        uint64_t chunk_bytes = (uint64_t)hub->get_page_size() * (uint64_t)page_mode;
+        chunk_bytes = chunk_bytes / static_cast<uint64_t>(1024);
+        uint64_t row_chunk = (static_cast<uint64_t>(stride) + (uint64_t)chunk_bytes - 1) / (uint64_t)chunk_bytes;
+        uint64_t row_page = row_chunk * (uint64_t)page_mode;
+        assert(row_page <= num_pages);
+
+        // interleave pages
+        uint64_t tot_alloc_count = 0;
+        bool exit_flag = false;  // for loop exit
+        for (uint64_t i = 0; i < num_pages; i += row_page) {
+            for (uint64_t c = 0; c < row_chunk; c++){
+                hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id, static_cast<unsigned>(page_mode));
+                for (uint64_t page = 0; page < (uint64_t)page_mode; page++){
+                    assert(tot_alloc_count < num_pages);
+                    uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+
+                    tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
+                    shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                    tot_alloc_count++;
+                }
+                if (tot_alloc_count == num_pages) {
+                    exit_flag = true;
+                    break;
+                }
+            }
+            chiplet_id++;
+            if (chiplet_id >= tot_chiplet_num) {
+                chiplet_id = 0;
+            }
+            if (exit_flag)
+                break;
+        }
+        assert(tot_alloc_count == num_pages);
+    }
+
+    void allocate_column_based(uint64_t base_vpn, uint64_t num_pages, unsigned row_width) {
+        assert(row_width != 0);
+        uint64_t page_mode  = (uint64_t)m_config->set_page_size;
+        unsigned tot_chiplet_num = m_config->chiplet_num;
+
+        // calculate column stride
+        uint64_t stride = static_cast<uint64_t>(row_width) / static_cast<uint64_t>(tot_chiplet_num);
+        assert(static_cast<uint64_t>(row_width) % static_cast<uint64_t>(tot_chiplet_num) == 0);  // prevent unexpected error
+
+        // calculate interleave size, row width is byte unit
+        uint64_t chunk_bytes = (uint64_t)hub->get_page_size() * (uint64_t)page_mode;
+        chunk_bytes = chunk_bytes / static_cast<uint64_t>(1024);
+        fprintf(stderr, "Column-based : chunk_bytes = %5lu\n", chunk_bytes);
+
+        uint64_t row_chunk = ((uint64_t)stride + (uint64_t)chunk_bytes - 1) / (uint64_t)chunk_bytes;
+
+        uint64_t row_page = row_chunk * (uint64_t)page_mode;
+        fprintf(stderr, "Column-based : row_chunk = %5lu\n", row_chunk);
+
+        assert(row_page <= num_pages);
+
+        // interleave page
+        unsigned chiplet_id = 0;
+        uint64_t tot_alloc_count = 0;
+        bool exit_flag = false;  // for loop exit
+        for (uint64_t i = 0; i < num_pages; i += row_page) {
+            for (uint64_t c = 0; c < row_chunk; c++){
+                hub->get_pmm()->allocate(APP_ID, base_vpn + tot_alloc_count, page_mode, chiplet_id, static_cast<unsigned>(page_mode));
+                for (uint64_t page = 0; page < (uint64_t)page_mode; page++){
+                    assert(tot_alloc_count < num_pages);
+                    uint64_t alloc_vpn = base_vpn + tot_alloc_count;
+
+                    tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
+                    shared_tlb->record_page_size(alloc_vpn, chiplet_id, page_mode);
+                    tot_alloc_count++;
+                }
+                if (tot_alloc_count == num_pages) {
+                    exit_flag = true;
+                    break;
+                }
+            }
+            chiplet_id +=1;
+            if (chiplet_id >= tot_chiplet_num) {
+                chiplet_id = 0;
+            }
+            if (exit_flag)
+                break;
+        }
+        assert(tot_alloc_count == num_pages);
+    }
+
+    void free(void* a) {
+    }
+};
+
+Hub::Hub(uint64_t rmt, uint64_t ps, uint64_t hps, uint64_t tp, unsigned chiplet, uint64_t sv, mmu *get_mmu) {
+    // tp is total size of memory, in base pages
+    // PMM currently rounds that down to the nearest size in huge pages
+    round_malloc_to = rmt;
+    page_size = ps;
+    huge_page_size = hps;
+    start_vaddr = sv;
+
+    m_chiplet = chiplet;
+    m_mmu = get_mmu;
+    m_mem_config = get_mmu->get_mem_config();
+    pmm = new PMM(this, huge_page_size, tp, m_chiplet, get_mmu->get_mem_config());
+
+    uint64_t tot_size_shift = static_cast<uint64_t>(log2(static_cast<double>(tp)));
+    uint64_t chiplet_shift  = static_cast<uint64_t>(log2(static_cast<double>(chiplet)));
+
+    m_chiplet_find_shift = tot_size_shift - chiplet_shift;
+    m_page_size_shift = static_cast<new_addr_type>(log2(static_cast<double>(ps)));
+}
+
+void* Hub::allocate(uint64_t old_ID, uint64_t bytes) {
+    uint64_t ID = APP_ID;
+    if (vmms[ID] == nullptr) {
+        vmms[ID] = new VMM(this, ID, m_mem_config, m_mmu);
+    }
+    uint64_t addr = uint64_t(vmms[ID]->allocate(bytes));
+    print();
+    return (void*)addr;
+}
+
+void Hub::free(uint64_t old_ID, void* addr) {
+    uint64_t ID = APP_ID;
+    assert(vmms[ID] != nullptr && "bad appID");
+    const uint64_t mask = (max_uint64 >>34);
+    vmms[ID]->free((void*)(uint64_t(addr) & mask));
+}
+
+void Hub::print() {
+    for (auto it = vmms.begin(); it != vmms.end(); ++it) {
+        printf("Virtual memory stats for ID %lu\n", it->first);
+        it->second->print();
+    }
+}
+
+void* Hub::translate(uint64_t old_ID, void* vaddr, unsigned chiplet) {
+    unsigned alloc_chiplet = chiplet;
+
+    uint64_t ID = APP_ID;
+    const uint64_t mask = (max_uint64 >> 16);  // 48-bit parsing mask
+    const uint64_t fixed_vaddr = reinterpret_cast<uint64_t>(vaddr) & mask;  // 48-bit parsing mask
+    const uint64_t vpn = static_cast<uint64_t>(fixed_vaddr) / page_size;
+
+    unsigned page_mode = m_mem_config->set_page_size;
+    if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+        unsigned malloc_num = get_malloc(vpn << 12);
+        alloc_chiplet = pmm->get_alloc_chiplet(malloc_num, chiplet);
+    }
+
+    // virtual address should be allocated at first
+    uint64_t phys_page_addr = pmm->translate(ID, vpn);
+    if (phys_page_addr == max_uint64) {
+        tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
+        unsigned page_mode = m_mem_config->set_page_size;
+        shared_tlb->record_page_size(vpn, alloc_chiplet, page_mode);
+        mapping_pages(vpn, page_mode, alloc_chiplet);
+    }
+    phys_page_addr = pmm->translate(ID, vpn);
+    assert(phys_page_addr != max_uint64 && "failed to register virtual address");
+    return (void*)(phys_page_addr + static_cast<uint64_t>(fixed_vaddr) % page_size);
+}
+
+void Hub::mapping_pages(uint64_t vpn, unsigned int page_size, unsigned int chiplet) {
+    uint64_t ID = APP_ID;
+    new_addr_type offset_shift = (new_addr_type)(std::log2(static_cast<float>(page_size)));
+    new_addr_type base_vpn = (new_addr_type)(static_cast<new_addr_type>(vpn >> offset_shift) << offset_shift);
+    if (page_size > static_cast<uint64_t>(PAGE_2M)) {
+        assert(0 && "Not supported yet!");
+    } else {
+        pmm->allocate(ID, base_vpn, page_size, chiplet, page_size);
+    }
+    for (uint64_t i = 0; i < static_cast<uint64_t>(page_size); i++){
+        uint64_t alloc_vpn = base_vpn + i;
+        if (page_size > static_cast<uint64_t>(PAGE_2M)) {
+            assert(0 && "Not supported yet!");
+        }
+    }
+}
+
+bool Hub::check_mapping(uint64_t vpn) {
+    uint64_t ID = APP_ID;
+    uint64_t search_vpn = vpn | (uint64_t{1} << (63 - 12));
+    uint64_t phys_page_addr = pmm->translate(ID, search_vpn);
+    if (phys_page_addr == max_uint64) {
+        return false;
+    } else {
+        return true;
+    }
+}
+
+void Hub::copy_alloc_result(unsigned int &total_result, std::vector<unsigned int> & chiplet_result) {
+    pmm->copy_alloc_result(total_result, chiplet_result);
+}
+
+uint64_t Hub::get_malloc_num_pages(unsigned malloc_num) {
+    uint64_t ID = APP_ID;
+    return vmms[ID]->get_malloc_num_pages(malloc_num);
+}
+
+unsigned Hub::get_malloc(uint64_t base_addr) {
+    uint64_t ID = APP_ID;
+    return vmms[ID]->get_malloc(base_addr);
+}
+
+unsigned Hub::get_tot_malloc_num() {
+    uint64_t ID = APP_ID;
+    return vmms[ID]->get_tot_malloc_num();
+}
+
+float Hub::get_malloc_remote_ratio(unsigned malloc_num) {
+    uint64_t access = m_mmu->get_L2_tlb()->get_mem_stat()->tot_access_malloc[malloc_num];
+    uint64_t remote = m_mmu->get_L2_tlb()->get_mem_stat()->tot_remote_access_malloc[malloc_num];
+    if (access == 0) return 0;
+    return (static_cast<float>(remote) / static_cast<float>(access));
+}
+
+unsigned Hub::get_map_chiplet(uint64_t vpn) {
+    uint64_t ID = APP_ID;
+    const uint64_t paddr = uint64_t(pmm->translate(ID, vpn));
+    const uint64_t ppn   = uint64_t(paddr) / page_size;
+    unsigned map_chiplet = (unsigned)((ppn >> m_chiplet_find_shift) & (uint64_t)(m_chiplet-1));
+    return map_chiplet;
 }

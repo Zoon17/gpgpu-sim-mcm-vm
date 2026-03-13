@@ -31,6 +31,12 @@
 #include "cuda-sim/cuda-sim.h"
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
+#include "abstract_hardware_model.h"
+#include "gpgpu-sim/l2cache.h"
+#include <string>
+#include <vector>
+
+#define APP_ID 1
 
 unsigned CUstream_st::sm_next_stream_uid = 0;
 
@@ -120,17 +126,17 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
   switch (m_type) {
     case stream_memcpy_host_to_device:
       if (g_debug_execution >= 3) printf("memcpy host-to-device\n");
-      gpu->memcpy_to_gpu(m_device_address_dst, m_host_address_src, m_cnt);
+      gpu->memcpy_to_gpu(m_device_address_dst, m_host_address_src, m_cnt, APP_ID);
       m_stream->record_next_done();
       break;
     case stream_memcpy_device_to_host:
       if (g_debug_execution >= 3) printf("memcpy device-to-host\n");
-      gpu->memcpy_from_gpu(m_host_address_dst, m_device_address_src, m_cnt);
+      gpu->memcpy_from_gpu(m_host_address_dst, m_device_address_src, m_cnt, APP_ID);
       m_stream->record_next_done();
       break;
     case stream_memcpy_device_to_device:
       if (g_debug_execution >= 3) printf("memcpy device-to-device\n");
-      gpu->memcpy_gpu_to_gpu(m_device_address_dst, m_device_address_src, m_cnt);
+      gpu->memcpy_gpu_to_gpu(m_device_address_dst, m_device_address_src, m_cnt, APP_ID);
       m_stream->record_next_done();
       break;
     case stream_memcpy_to_symbol:
@@ -227,6 +233,8 @@ void stream_operation::print(FILE *fp) const {
     case stream_no_op:
       fprintf(fp, "no-op");
       break;
+    default:
+      break;
   }
 }
 
@@ -242,6 +250,7 @@ bool stream_manager::operation(bool *sim) {
   bool check = check_finished_kernel();
   pthread_mutex_lock(&m_lock);
   //    if(check)m_gpu->print_stats();
+  //if(check)m_gpu->print_stat_file();  // print stat by each kernel
   stream_operation op = front();
   if (!op.do_operation(m_gpu))  // not ready to execute
   {
@@ -300,6 +309,14 @@ bool stream_manager::register_finished_kernel(unsigned grid_uid) {
 void stream_manager::stop_all_running_kernels() {
   pthread_mutex_lock(&m_lock);
 
+  std::vector<unsigned long long> finished_streams;
+  std::vector<kernel_info_t *> running_kernels = m_gpu->get_running_kernels();
+  for (kernel_info_t *k : running_kernels) {
+    if (k != NULL) {
+      finished_streams.push_back(k->get_streamID());
+    }
+  }
+
   // Signal m_gpu to stop all running kernels
   m_gpu->stop_all_running_kernels();
 
@@ -310,7 +327,9 @@ void stream_manager::stop_all_running_kernels() {
   }
 
   // If any kernels completed, print out the current stats
-  if (count > 0) m_gpu->print_stats();
+  for (unsigned long long streamID : finished_streams) {
+    if (count > 0) m_gpu->print_stats(streamID);
+  }
 
   pthread_mutex_unlock(&m_lock);
 }

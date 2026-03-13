@@ -1,3 +1,8 @@
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
 // Copyright (c) 2009-2011, Tor M. Aamodt
 // The University of British Columbia
 // All rights reserved.
@@ -32,25 +37,46 @@
 #include <stdio.h>
 #include <zlib.h>
 #include <map>
+#include "mem_fetch.h"
+#include "gpu-cache.h"
 
 class memory_config;
 class memory_stats_t {
- public:
+public:
+  const static uint64_t stat_arr_size = 10;
+  uint64_t div(uint64_t x, uint64_t y);
+  float div_float(uint64_t x, uint64_t y);
+  void print_stat(const char *, uint64_t, FILE *file);
+  void print_stat_float(const char *, float, FILE *file);
+  void print_app_stat(const char *, uint64_t, uint64_t *, uint64_t, uint64_t *, FILE *file);
+  void newline(FILE *file);
+
+  unsigned m_chiplet = 0;
+  void set_chiplet(unsigned chiplet) { m_chiplet = chiplet; }
+
+  void data_latency_stat(mem_fetch * mf);
+  void mcm_cache_stat(cache_request_status access_status, cache_request_status probe_status, bool is_partition, mem_fetch * mf);
+
+public:
   memory_stats_t(unsigned n_shader,
                  const class shader_core_config *shader_config,
                  const memory_config *mem_config, const class gpgpu_sim *gpu);
 
-  unsigned memlatstat_done(class mem_fetch *mf);
+  unsigned memlatstat_done(class mem_fetch *mf);  // may be need to fix it unsigned -> uint64_t
   void memlatstat_read_done(class mem_fetch *mf);
   void memlatstat_dram_access(class mem_fetch *mf);
   void memlatstat_icnt2mem_pop(class mem_fetch *mf);
-  void memlatstat_lat_pw();
   void memlatstat_print(unsigned n_mem, unsigned gpu_mem_n_bk);
+  void memlatstat_print_file(FILE *outputfile, unsigned n_mem, unsigned gpu_mem_n_bk);
 
   void visualizer_print(gzFile visualizer_file);
 
   // Reset local L2 stats that are aggregated each sampling window
   void clear_L2_stats_pw();
+
+  void print_essential(FILE *fout);
+  void print_tlb_stat(FILE *fout);
+  void print_mcm_stat(FILE *fout);
 
   unsigned m_n_shader;
 
@@ -101,14 +127,6 @@ class memory_stats_t {
   unsigned L2_read_hit;
   unsigned L2_write_hit;
 
-  // L2 cache stats
-  unsigned int *L2_cbtoL2length;
-  unsigned int *L2_cbtoL2writelength;
-  unsigned int *L2_L2tocblength;
-  unsigned int *L2_dramtoL2length;
-  unsigned int *L2_dramtoL2writelength;
-  unsigned int *L2_L2todramlength;
-
   // DRAM access row locality stats
   unsigned int *
       *concurrent_row_access;    // concurrent_row_access[dram chip id][bank id]
@@ -123,6 +141,130 @@ class memory_stats_t {
   unsigned total_n_access;
   unsigned total_n_reads;
   unsigned total_n_writes;
+
+  // collect page walk local/remote stat
+  void collect_pw_numa_stat(mem_fetch * mf);
+
+  uint64_t l1_tlb_tot_access = 0;
+  uint64_t l1_tlb_tot_hit = 0;
+  uint64_t l1_tlb_tot_miss = 0;
+  uint64_t l1_tlb_tot_hit_reserved = 0;
+  uint64_t l1_tlb_tot_fail = 0;
+  // mshr detail
+  uint64_t l1_tlb_mshr_allocate_fail = 0;
+  uint64_t l1_tlb_mshr_merge_fail    = 0;
+  uint64_t l1_tlb_mshr_l2_stall      = 0;
+
+  // mshr detail
+  uint64_t l2_tlb_mshr_allocate_fail = 0;
+  uint64_t l2_tlb_mshr_merge_fail    = 0;
+  uint64_t l2_tlb_mshr_pwq_full      = 0;
+
+  // L2 cache write-back stat
+  uint64_t l2_write_back_generate = 0;
+  uint64_t l2_write_back_try      = 0;
+  uint64_t l2_write_back_success  = 0;
+  uint64_t l2_write_back_fail     = 0;
+
+  uint64_t pt_space_size;
+  uint64_t tlb_level_accesses[stat_arr_size];
+  uint64_t tlb_level_hits[stat_arr_size];
+  uint64_t tlb_level_misses[stat_arr_size];
+  uint64_t tlb_level_fails[stat_arr_size];
+
+  uint64_t total_num_mfs = 0;
+  uint64_t tlb_total_num_mfs = 0;
+  uint64_t data_total_num_mfs = 0;
+
+  uint64_t l2_tlb_tot_hits, l2_tlb_tot_misses, l2_tlb_tot_accesses,
+          l2_tlb_tot_mshr_hits, l2_tlb_tot_mshr_fails,
+          l2_tlb_tot_backpressure_fails,
+          l2_tlb_tot_backpressure_stalls;
+
+  //page walk statistics
+  uint64_t pwq_tot_lat;
+  uint64_t pw_tot_lat, pw_tot_num;
+
+  uint64_t pwc_tot_accesses, pwc_tot_hits, pwc_tot_misses;
+  uint64_t pwc_tot_addr_lvl_accesses[stat_arr_size], pwc_tot_addr_lvl_hits[stat_arr_size], pwc_tot_addr_lvl_misses[stat_arr_size];
+
+  uint64_t pw_tot_access    = 0;
+  uint64_t pw_local_access  = 0;
+  uint64_t pw_remote_access = 0;
+
+  uint64_t pw_leaf_local  = 0;
+  uint64_t pw_leaf_remote = 0;
+
+  uint64_t data_tot_latency        = 0;
+  uint64_t data_tot_count          = 0;
+  uint64_t data_local_tot_latency  = 0;
+  uint64_t data_local_tot_count    = 0;
+  uint64_t data_remote_tot_latency = 0;
+  uint64_t data_remote_tot_count   = 0;
+
+  uint64_t tlb_tot_latency = 0;
+  uint64_t tlb_tot_count   = 0;
+
+  uint64_t tot_local_access  = 0;
+  uint64_t tot_remote_access = 0;
+
+  uint64_t l1_cache_access       = 0;
+  uint64_t l1_cache_hit          = 0;
+  uint64_t l1_cache_hit_reserved = 0;
+  uint64_t l1_cache_miss         = 0;
+  uint64_t l1_cache_reserve_fail = 0;
+
+  uint64_t l1_cache_local_access       = 0;
+  uint64_t l1_cache_local_hit          = 0;
+  uint64_t l1_cache_local_hit_reserved = 0;
+  uint64_t l1_cache_local_miss         = 0;
+  uint64_t l1_cache_local_reserve_fail = 0;
+
+  uint64_t l1_cache_remote_access       = 0;
+  uint64_t l1_cache_remote_hit          = 0;
+  uint64_t l1_cache_remote_hit_reserved = 0;
+  uint64_t l1_cache_remote_miss         = 0;
+  uint64_t l1_cache_remote_reserve_fail = 0;
+
+  uint64_t l2_cache_access       = 0;
+  uint64_t l2_cache_hit          = 0;
+  uint64_t l2_cache_hit_reserved = 0;
+  uint64_t l2_cache_miss         = 0;
+  uint64_t l2_cache_reserve_fail = 0;
+
+  uint64_t l2_cache_local_access       = 0;
+  uint64_t l2_cache_local_hit          = 0;
+  uint64_t l2_cache_local_hit_reserved = 0;
+  uint64_t l2_cache_local_miss         = 0;
+  uint64_t l2_cache_local_reserve_fail = 0;
+
+  uint64_t l2_cache_remote_access       = 0;
+  uint64_t l2_cache_remote_hit          = 0;
+  uint64_t l2_cache_remote_hit_reserved = 0;
+  uint64_t l2_cache_remote_miss         = 0;
+  uint64_t l2_cache_remote_reserve_fail = 0;
+
+  uint64_t l2_cache_remote_transfer_access       = 0;
+  uint64_t l2_cache_remote_transfer_hit          = 0;
+  uint64_t l2_cache_remote_transfer_hit_reserved = 0;
+  uint64_t l2_cache_remote_transfer_miss         = 0;
+  uint64_t l2_cache_remote_transfer_reserve_fail = 0;
+
+  std::map<unsigned, uint64_t> tot_access_malloc;
+  std::map<unsigned, uint64_t> tot_local_access_malloc;
+  std::map<unsigned, uint64_t> tot_remote_access_malloc;
+  uint64_t non_malloc_access = 0;
+
+  std::map<unsigned, bool> write_malloc;
+  std::map<unsigned, bool> tot_write_malloc;
+  uint64_t wb_error          = 0;
+  uint64_t tot_invalid_write = 0;
+  void reset_write_record();
+
+  std::map<unsigned, uint64_t> l1_hit_per_size;
+  std::map<unsigned, uint64_t> l2_hit_per_size;
+
+  new_addr_type m_fault_exception = 0;
 };
 
 #endif /*MEM_LATENCY_STAT_H*/

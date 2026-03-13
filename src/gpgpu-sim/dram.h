@@ -1,19 +1,21 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Ivan Sham, Ali Bakhoda,
-// George L. Yuan, Wilson W.L. Fung
-// The University of British Columbia
+// Copyright (c) 2009-2021, Tor M. Aamodt, Ivan Sham, Ali Bakhoda,
+// George L. Yuan, Wilson W.L. Fung, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -41,11 +43,51 @@
 #include <string>
 #include <vector>
 #include "delayqueue.h"
+#include "memory_owner.h"
 
 #define READ 'R'  // define read and write states
 #define WRITE 'W'
 #define BANK_IDLE 'I'
 #define BANK_ACTIVE 'A'
+
+#define BANK_BLOCKED 'B' //LISA modify data within the bank
+#define BANK_BLOCKED_PENDING 'P' //Sent inter-bank command, waiting for both banks to be idle
+#define BANK_TRANSFER 'T' //Row-clone PSM Mode, blocking two banks (source, target)
+
+#define LISA_COPY 0
+#define InterSA_COPY 1
+#define IntraSA_COPY 2
+#define RC_PSM 3
+#define RC_IntraSA 4
+#define RC_zero 5
+#define Channel_copy 6
+#define COPY 7 //Generic copy, will figure the best timing from from/to_bank and subarrays
+#define TARGET 8 //Target bank, got the command from other bank
+#define ZERO 9 //Baseline zeroing a page
+#define SCAN 10 //SCAN request (works similar to a read request, but does not queue in DRAM request queue from the GPU core side
+#define DRAM_CMD 12345678 //Special ID for DRAM command, so that addrdec can parse dram command address
+
+struct page;
+class tlb_tag_array;
+class Hub;
+
+class dram_cmd{
+public:
+    dram_cmd(int cmd, int from_bk, int to_bk, int from_ch, int to_ch, int from_subarray, int to_sa,
+             int pk_size, int app_ID, const struct memory_config * config);
+    dram_cmd(int cmd, page * from_page, page * to_page, const struct memory_config * config);
+    int command;
+    int from_bank;
+    int from_channel;
+    int from_sa;
+    int to_bank;
+    int to_channel;
+    int to_sa;
+    int size;
+    int appID;
+    const struct memory_config *m_config;
+};
+/************************/
 
 class dram_req_t {
  public:
@@ -84,6 +126,7 @@ struct bank_t {
   unsigned char rw;     // is the bank reading or writing?
   unsigned char state;  // is the bank active or idle?
   unsigned int curr_row;
+  unsigned int curr_subarray;
 
   dram_req_t *mrq;
 
@@ -91,7 +134,12 @@ struct bank_t {
   unsigned int n_writes;
   unsigned int n_idle;
 
-  unsigned int bkgrpindex;
+  //Counter for BANK_BLOCKED and BANK_TRANSFER, if these are zeros, banks should become idle
+  unsigned int blocked;
+  unsigned int transfer;
+  std::list<dram_cmd*> * cmd_queue;
+
+    unsigned int bkgrpindex;
 };
 
 enum bank_index_function {
@@ -110,7 +158,30 @@ class dram_t {
  public:
   dram_t(unsigned int parition_id, const memory_config *config,
          class memory_stats_t *stats, class memory_partition_unit *mp,
-         class gpgpu_sim *gpu);
+         class gpgpu_sim *gpu,
+         mmu * page_manager,
+         tlb_tag_array * shared_tlb);
+
+  mmu * m_page_manager;
+  tlb_tag_array * m_shared_tlb;
+
+  unsigned compaction_bank_id;
+  unsigned data_bus_busy;
+
+  unsigned dram_bwutil();
+
+  unsigned dram_bwutil_data();
+
+  unsigned dram_bwutil_tlb();
+
+  void set_miss(float m);
+  void set_miss_core(float m, unsigned which_core);
+
+  float get_miss();
+  float get_miss_core(unsigned i);
+
+  float get_rbl();
+  /*****************************/
 
   bool full(bool is_write) const;
   void print(FILE *simFile) const;
@@ -132,10 +203,12 @@ class dram_t {
   class gpgpu_sim *m_gpu;
   unsigned int id;
 
+  void insert_dram_command(dram_cmd * cmd);
+
   // Power Model
   void set_dram_power_stats(unsigned &cmd, unsigned &activity, unsigned &nop,
                             unsigned &act, unsigned &pre, unsigned &rd,
-                            unsigned &wr, unsigned &req) const;
+                            unsigned &wr, unsigned &wr_WB, unsigned &req) const;
 
   const memory_config *m_config;
 
@@ -168,6 +241,8 @@ class dram_t {
   // buffer to hold packets when DRAM processing is over
   // should be filled with dram clock and popped with l2or icnt clock
   fifo_pipeline<mem_fetch> *returnq;
+
+  std::list<mem_fetch*> wait_list;  // A queue for TLB-related requests
 
   unsigned int dram_util_bins[10];
   unsigned int dram_eff_bins[10];
@@ -224,8 +299,26 @@ class dram_t {
   unsigned long long bkgrp_parallsim_rw;
 
   unsigned int bwutil;
+  unsigned int bwutil_data;
+  unsigned int bwutil_tlb;
   unsigned int max_mrqs;
   unsigned int ave_mrqs;
+
+  unsigned int bwutil_periodic;
+  unsigned int bwutil_periodic_data;
+  unsigned int bwutil_periodic_tlb;
+  unsigned int n_cmd_blp;
+  unsigned int  mem_state_blp;
+  unsigned int  mem_state_blp_alarm[32];
+  unsigned int  mem_state_blp_ncmd[32];
+  unsigned int sanity_read;
+  unsigned int sanity_write;
+
+  float miss_rate_d;
+  float miss_rate_d_core[64];
+
+  unsigned int dram_cycles;
+  unsigned int dram_cycles_active;
 
   class frfcfs_scheduler *m_frfcfs_scheduler;
 

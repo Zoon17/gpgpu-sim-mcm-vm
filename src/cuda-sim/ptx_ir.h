@@ -966,8 +966,8 @@ class ptx_instruction : public warp_inst_t {
   int get_pred_mod() const { return m_pred_mod; }
   const char *get_source() const { return m_source.c_str(); }
 
-  const std::list<int> get_scalar_type() const {return m_scalar_type;}
-  const std::list<int> get_options() const {return m_options;}
+  const std::list<int> get_scalar_type() const { return m_scalar_type; }
+  const std::list<int> get_options() const { return m_options; }
 
   typedef std::vector<operand_info>::const_iterator const_iterator;
 
@@ -1085,6 +1085,8 @@ class ptx_instruction : public warp_inst_t {
   unsigned cache_option() const { return m_cache_option; }
   unsigned rounding_mode() const { return m_rounding_mode; }
   unsigned saturation_mode() const { return m_saturation_mode; }
+  unsigned clamp_mode() const {return m_clamp_mode;}
+  unsigned left_mode() const { return m_left_mode; }
   unsigned dimension() const { return m_geom_spec; }
   unsigned barrier_op() const { return m_barrier_op; }
   unsigned shfl_op() const { return m_shfl_op; }
@@ -1126,6 +1128,9 @@ class ptx_instruction : public warp_inst_t {
   void set_fp_or_int_archop();
   void set_mul_div_or_other_archop();
 
+  // page fault flag. If true, this instruction trigger a page fault
+  bool m_fault;
+
   basic_block_t *m_basic_block;
   unsigned m_uid;
   addr_t m_PC;
@@ -1159,6 +1164,8 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_rounding_mode;
   unsigned m_compare_op;
   unsigned m_saturation_mode;
+  unsigned m_clamp_mode;
+  unsigned m_left_mode;
   unsigned m_barrier_op;
   unsigned m_shfl_op;
   unsigned m_prmt_op;
@@ -1248,6 +1255,7 @@ class function_info {
   const ptx_version &get_ptx_version() const {
     return m_symtab->get_ptx_version();
   }
+  virtual ~function_info(){}
   unsigned get_sm_target() const { return m_symtab->get_sm_target(); }
   bool is_extern() const { return m_extern; }
   void set_name(const char *name) { m_name = name; }

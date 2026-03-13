@@ -143,9 +143,12 @@
 #include "../src/gpgpusim_entrypoint.h"
 #include "../src/stream_manager.h"
 #include "../src/abstract_hardware_model.h"
+#include "../src/gpgpu-sim/dram.h"
 
 #include <pthread.h>
 #include <semaphore.h>
+
+#define APP_ID 1
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -435,7 +438,7 @@ std::string get_app_binary() {
 
 // above func gives abs path whereas this give just the name of application.
 char *get_app_binary_name(std::string abs_path) {
-  char *self_exe_path;
+  char *self_exe_path = NULL;
 #ifdef __APPLE__
   // TODO: get apple device and check the result.
   printf("WARNING: not tested for Apple-mac devices \n");
@@ -463,7 +466,11 @@ static int get_app_cuda_version() {
       "ldd " + get_app_binary() +
       " | grep libcudart.so | sed  's/.*libcudart.so.\\(.*\\) =>.*/\\1/' > " +
       fname;
-  system(app_cuda_version_command.c_str());
+  int res = system(app_cuda_version_command.c_str());
+  if(res == -1){
+    printf("Error - Cannot detect the app's CUDA version.\n");
+    exit(1);
+  }
   FILE *cmd = fopen(fname, "r");
   char buf[256];
   while (fgets(buf, sizeof(buf), cmd) != 0) {
@@ -970,6 +977,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
   global_mem = gpu->get_global_memory();
 
   if (gpu->resume_option == 1 && (grid->get_uid() == gpu->resume_kernel)) {
+    assert(0);  // not used
     char f1name[2048];
     snprintf(f1name, 2048, "checkpoint_files/global_mem_%d.txt",
              grid->get_uid());
@@ -1113,7 +1121,7 @@ cudaError_t cudaHostGetDevicePointerInternal(void **pDevice, void *pHost,
   if (*pDevice) {
     ctx->api->pinned_memory[pHost] = pDevice;
     // Copy contents in cpu to gpu
-    gpu->memcpy_to_gpu((size_t)*pDevice, pHost, size);
+    gpu->memcpy_to_gpu((size_t)*pDevice, pHost, size, APP_ID);
     return g_last_cudaError = cudaSuccess;
   } else {
     return g_last_cudaError = cudaErrorMemoryAllocation;
@@ -1221,11 +1229,11 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyToArrayInternal(
   size_t size = count;
   printf("GPGPU-Sim PTX: cudaMemcpyToArray\n");
   if (kind == cudaMemcpyHostToDevice)
-    gpu->memcpy_to_gpu((size_t)(dst->devPtr), src, size);
+    gpu->memcpy_to_gpu((size_t)(dst->devPtr), src, size, APP_ID);
   else if (kind == cudaMemcpyDeviceToHost)
-    gpu->memcpy_from_gpu(dst->devPtr, (size_t)src, size);
+    gpu->memcpy_from_gpu(dst->devPtr, (size_t)src, size, APP_ID);
   else if (kind == cudaMemcpyDeviceToDevice)
-    gpu->memcpy_gpu_to_gpu((size_t)(dst->devPtr), (size_t)src, size);
+    gpu->memcpy_gpu_to_gpu((size_t)(dst->devPtr), (size_t)src, size, APP_ID);
   else {
     printf(
         "GPGPU-Sim PTX: cudaMemcpyToArray - ERROR : unsupported "
@@ -1254,11 +1262,11 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DInternal(
   gpgpusim_ptx_assert((dpitch == spitch),
                       "different src and dst pitch not supported yet");
   if (kind == cudaMemcpyHostToDevice)
-    gpu->memcpy_to_gpu((size_t)dst, src, size);
+    gpu->memcpy_to_gpu((size_t)dst, src, size, APP_ID);
   else if (kind == cudaMemcpyDeviceToHost)
-    gpu->memcpy_from_gpu(dst, (size_t)src, size);
+    gpu->memcpy_from_gpu(dst, (size_t)src, size, APP_ID);
   else if (kind == cudaMemcpyDeviceToDevice)
-    gpu->memcpy_gpu_to_gpu((size_t)dst, (size_t)src, size);
+    gpu->memcpy_gpu_to_gpu((size_t)dst, (size_t)src, size, APP_ID);
   else {
     printf(
         "GPGPU-Sim PTX: cudaMemcpy2D - ERROR : unsupported cudaMemcpyKind\n");
@@ -1299,11 +1307,11 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DToArrayInternal(
                       "partial copy not supported");
   gpgpusim_ptx_assert((spitch == width), "spitch != width not supported");
   if (kind == cudaMemcpyHostToDevice)
-    gpu->memcpy_to_gpu((size_t)(dst->devPtr), src, size);
+    gpu->memcpy_to_gpu((size_t)(dst->devPtr), src, size, APP_ID);
   else if (kind == cudaMemcpyDeviceToHost)
-    gpu->memcpy_from_gpu(dst->devPtr, (size_t)src, size);
+    gpu->memcpy_from_gpu(dst->devPtr, (size_t)src, size, APP_ID);
   else if (kind == cudaMemcpyDeviceToDevice)
-    gpu->memcpy_gpu_to_gpu((size_t)dst->devPtr, (size_t)src, size);
+    gpu->memcpy_gpu_to_gpu((size_t)dst->devPtr, (size_t)src, size, APP_ID);
   else {
     printf(
         "GPGPU-Sim PTX: cudaMemcpy2D - ERROR : unsupported cudaMemcpyKind\n");
@@ -1410,14 +1418,16 @@ cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
   function_info *entry = context->get_kernel(hostFunc);
   printf(
       "Calculate Maxium Active Block with function ptr=%p, blockSize=%d, "
-      "SMemSize=%d\n",
+      "SMemSize=%lu\n",
       hostFunc, blockSize, dynamicSMemSize);
   if (flags == cudaOccupancyDefault) {
     // create kernel_info based on entry
     dim3 gridDim(context->get_device()->get_gpgpu()->max_cta_per_core() *
                  context->get_device()->get_gpgpu()->get_config().num_shader());
     dim3 blockDim(blockSize);
-    kernel_info_t result(gridDim, blockDim, entry);
+    // because this fuction is only checking for resource requirements, we do
+    // not care which stream this kernel runs at, just picked -1
+    kernel_info_t result(gridDim, blockDim, entry, -1);
     // if(entry == NULL){
     //	*numBlocks = 1;
     //	return g_last_cudaError = cudaErrorUnknown;
@@ -1447,7 +1457,7 @@ __host__ cudaError_t CUDARTAPI cudaMemsetInternal(
   }
   CUctx_st *context = GPGPUSim_Context(ctx);
   gpgpu_t *gpu = context->get_device()->get_gpgpu();
-  gpu->gpu_memset((size_t)mem, c, count);
+  gpu->gpu_memset((size_t)mem, c, count, APP_ID);
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -1468,7 +1478,7 @@ cudaMemsetAsyncInternal(void *mem, int c, size_t count, cudaStream_t stream = 0,
          __my_func__);
   CUctx_st *context = GPGPUSim_Context(ctx);
   gpgpu_t *gpu = context->get_device()->get_gpgpu();
-  gpu->gpu_memset((size_t)mem, c, count);
+  gpu->gpu_memset((size_t)mem, c, count, APP_ID);
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -1514,7 +1524,7 @@ cudaError_t cudaGLMapBufferObjectInternal(void **devPtr, GLuint bufferObj,
   if (*devPtr) {
     char *data = (char *)calloc(p->m_size, 1);
     glGetBufferSubData(GL_ARRAY_BUFFER, 0, buffer_size, data);
-    memcpy_to_gpu((size_t)*devPtr, data, buffer_size);
+    memcpy_to_gpu((size_t)*devPtr, data, buffer_size, APP_ID);
     free(data);
     printf(
         "GPGPU-Sim PTX: cudaGLMapBufferObject %zu bytes starting at 0x%llx..\n",
@@ -1733,6 +1743,9 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 19:
         *value = 0;
         break;
+      case 20:       // cudaDevAttrComputeMode for controlling cudaSetDevice for
+                     // threads
+        *value = 0;  // Dummy value, should not affect simulation
       case 21:
       case 22:
       case 23:
@@ -1866,6 +1879,7 @@ __host__ cudaError_t CUDARTAPI cudaBindTextureInternal(
     size_t *offset, const struct textureReference *texref, const void *devPtr,
     const struct cudaChannelFormatDesc *desc, size_t size __dv(UINT_MAX),
     gpgpu_context *gpgpu_ctx = NULL) {
+#if (CUDART_VERSION <= 1200)
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;
@@ -1902,12 +1916,14 @@ __host__ cudaError_t CUDARTAPI cudaBindTextureInternal(
   gpu->gpgpu_ptx_sim_bindTextureToArray(texref, array);
   devPtr = (void *)(long long)array->devPtr32;
   printf("GPGPU-Sim PTX: devPtr = %p\n", devPtr);
+#endif
   return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaBindTextureToArrayInternal(
     const struct textureReference *texref, const struct cudaArray *array,
     const struct cudaChannelFormatDesc *desc, gpgpu_context *gpgpu_ctx = NULL) {
+#if (CUDART_VERSION <= 1200)
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;
@@ -1925,11 +1941,13 @@ __host__ cudaError_t CUDARTAPI cudaBindTextureToArrayInternal(
          gpu->gpgpu_ptx_sim_findNamefromTexture(texref));
   printf("GPGPU-Sim PTX:   Texture Normalized? = %d\n", texref->normalized);
   gpu->gpgpu_ptx_sim_bindTextureToArray(texref, array);
+#endif
   return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaUnbindTextureInternal(
     const struct textureReference *texref, gpgpu_context *gpgpu_ctx = NULL) {
+#if (CUDART_VERSION <= 1200)
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;
@@ -1949,6 +1967,7 @@ __host__ cudaError_t CUDARTAPI cudaUnbindTextureInternal(
          gpu->gpgpu_ptx_sim_findNamefromTexture(texref));
 
   gpu->gpgpu_ptx_sim_unbindTexture(texref);
+#endif
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -2101,7 +2120,7 @@ cudaError_t cudaGLUnmapBufferObjectInternal(GLuint bufferObj,
   if (p == NULL) return g_last_cudaError = cudaErrorUnknown;
 
   char *data = (char *)calloc(p->m_size, 1);
-  memcpy_from_gpu(data, (size_t)p->m_devPtr, p->m_size);
+  memcpy_from_gpu(data, (size_t)p->m_devPtr, p->m_size, APP_ID);
   glBufferSubData(GL_ARRAY_BUFFER, 0, p->m_size, data);
   free(data);
 
@@ -3234,7 +3253,12 @@ char *readfile(const std::string filename) {
   fseek(fp, 0, SEEK_SET);
   // allocate and copy the entire ptx
   char *ret = (char *)malloc((filesize + 1) * sizeof(char));
-  fread(ret, 1, filesize, fp);
+  int num = fread(ret, 1, filesize, fp);
+  if(num == 0){
+    std::cout << "ERROR: Could not read data from file %s\n"
+              << filename << std::endl;
+    assert(0);
+  }
   ret[filesize] = '\0';
   fclose(fp);
   return ret;
@@ -3478,7 +3502,7 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
     context->add_binary(symtab, handle);
     return;
   }
-  symbol_table *symtab;
+  symbol_table *symtab = NULL;
 
 #if (CUDART_VERSION >= 6000)
   // loops through all ptx files from smallest sm version to largest
@@ -3596,6 +3620,7 @@ unsigned CUDARTAPI __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim,
     announce_call(__my_func__);
   }
   cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream);
+  return 0;
 }
 
 cudaError_t CUDARTAPI __cudaPopCallConfiguration(dim3 *gridDim, dim3 *blockDim,
@@ -3953,8 +3978,8 @@ int CUDARTAPI __cudaSynchronizeThreads(void **, void *) {
 /// static functions
 
 int cuda_runtime_api::load_static_globals(symbol_table *symtab,
-                                          unsigned min_gaddr,
-                                          unsigned max_gaddr, gpgpu_t *gpu) {
+                                          addr_t min_gaddr,
+                                          addr_t max_gaddr, gpgpu_t *gpu) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3984,7 +4009,7 @@ int cuda_runtime_api::load_static_globals(symbol_table *symtab,
         assert((addr + offset + nbytes) <
                min_gaddr);  // min_gaddr is start of "heap" for cudaMalloc
         gpu->get_global_memory()->write(addr + offset, nbytes, &value, NULL,
-                                        NULL);  // assuming little endian here
+                                        NULL, APP_ID);  // assuming little endian here
         offset += nbytes;
         ng_bytes += nbytes;
       }
@@ -4040,7 +4065,7 @@ int cuda_runtime_api::load_constants(symbol_table *symtab, addr_t min_gaddr,
 
         gpu->get_global_memory()->write(
             addr, nbytes, &value, NULL,
-            NULL);  // assume little endian (so u8 is the first byte in u32)
+            NULL, APP_ID);  // assume little endian (so u8 is the first byte in u32)
         nc_bytes += nbytes;
         nbytes_written += nbytes;
       }

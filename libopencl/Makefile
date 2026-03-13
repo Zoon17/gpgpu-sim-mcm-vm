@@ -66,8 +66,10 @@ ifeq ($(OPENGL_SUPPORT),1)
 	GL = -DOPENGL_SUPPORT
 endif
 
-CPP = g++
-CC = gcc
+# jun: Makefile update
+CXX ?= g++
+CPP = $(CXX)
+CC ?= gcc
 CREATELIBRARY    =  1
 DEBUG ?= 0
 CCFLAGS = -O3 -g -Wall -fPIC $(GL)

@@ -50,7 +50,7 @@ endif
 ifneq ($(DEBUG),1)
 	OPTFLAGS += -O3
 else
-	CXXFLAGS += 
+	CXXFLAGS +=
 endif
 
 CXXFLAGS += -I$(CUDA_INSTALL_PATH)/include
@@ -63,14 +63,15 @@ endif
 OPTFLAGS += -g3 -fPIC
 OPTFLAGS += -DCUDART_VERSION=$(CUDART_VERSION)
 
-CPP = g++ $(SNOW)
+CXX ?= g++
+CPP = $(CXX) $(SNOW)
 OEXT = o
 
 OUTPUT_DIR=$(SIM_OBJ_FILES_DIR)/gpgpu-sim
 
 SRCS = $(shell ls *.cc)
 
-EXCLUDES = 
+EXCLUDES =
 
 ifeq ($(GPGPUSIM_POWER_MODEL), )
 EXCLUDES += power_interface.cc

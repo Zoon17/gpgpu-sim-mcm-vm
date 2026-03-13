@@ -1,3 +1,8 @@
+// ---------------------------------------------------------------------------
+// Modified by: Junhyeok Park (2023-2026)
+// Purpose: Add logic for address translation and handling multi-chip module
+// (MCM) GPUs
+// ---------------------------------------------------------------------------
 // Copyright (c) 2009-2011, Tor M. Aamodt, Wilson W.L. Fung,
 // The University of British Columbia
 // All rights reserved.
@@ -36,13 +41,21 @@
 
 #include "../abstract_hardware_model.h"
 
+#ifndef PT_SPACE
+#define PT_SPACE 987654321
+#endif
+
+class mmu;
+class memory_config;
+
 enum partition_index_function {
   CONSECUTIVE = 0,
-  BITWISE_PERMUTATION,
-  IPOLY,
-  PAE,
-  RANDOM,
-  CUSTOM
+  BITWISE_PERMUTATION = 1,
+  IPOLY = 2,
+  PAE = 3,
+  RANDOM = 4,
+  MCM_LOCALITY_AWARE = 5,
+  MCM_INTERLEAVE = 6
 };
 
 struct addrdec_t {
@@ -55,23 +68,29 @@ struct addrdec_t {
   unsigned burst;
 
   unsigned sub_partition;
+
+  unsigned subarray;  // not used
+  // requested partition
+  unsigned request_sub_partition;
+  unsigned map_chiplet;
 };
 
 class linear_to_raw_address_translation {
  public:
   linear_to_raw_address_translation();
   void addrdec_setoption(option_parser_t opp);
-  void init(unsigned int n_channel, unsigned int n_sub_partition_in_channel);
+  void init(unsigned int n_channel, unsigned int n_sub_partition_in_channel, memory_config * config);
 
   // accessors
-  void addrdec_tlx(new_addr_type addr, addrdec_t *tlx) const;
-  new_addr_type partition_address(new_addr_type addr) const;
+  bool addrdec_tlx(new_addr_type addr, addrdec_t *tlx, unsigned appID, unsigned level, bool isRead, unsigned chiplet) const;
+  new_addr_type partition_address(new_addr_type addr, unsigned appID, unsigned level, bool isRead, unsigned chiplet) const;
+  void set_mmu(mmu * page_manager);
 
  private:
   void addrdec_parseoption(const char *option);
   void sweep_test() const;  // sanity check to ensure no overlapping
 
-  enum { CHIP = 0, BK = 1, ROW = 2, COL = 3, BURST = 4, N_ADDRDEC };
+  enum { CHIP = 0, BK = 1, ROW = 2, COL = 3, BURST = 4, SUBARRAY = 5, N_ADDRDEC };
 
   const char *addrdec_option;
   int gpgpu_mem_address_mask;
@@ -91,6 +110,11 @@ class linear_to_raw_address_translation {
   unsigned log2channel;
   unsigned log2sub_partition;
   unsigned nextPowerOf2_m_n_channel;
+
+  mmu * m_mmu;
+  memory_config * m_config;
+  int m_n_bk;     // number of banks
+  int m_n_bkgrp;  // number of bank groups
 };
 
 #endif

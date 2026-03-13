@@ -1,19 +1,21 @@
-// Copyright (c) 2009-2011, Tor M. Aamodt, Wilson W.L. Fung, Ali Bakhoda,
-// Ivan Sham, George L. Yuan,
-// The University of British Columbia
+// Copyright (c) 2009-2021, Tor M. Aamodt, Wilson W.L. Fung, Ali Bakhoda,
+// Ivan Sham, George L. Yuan, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
-// Redistributions of source code must retain the above copyright notice, this
-// list of conditions and the following disclaimer.
-// Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution. Neither the name of
-// The University of British Columbia nor the names of its contributors may be
-// used to endorse or promote products derived from this software without
-// specific prior written permission.
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -35,6 +37,11 @@
 #include "l2cache.h"
 #include "mem_fetch.h"
 #include "mem_latency_stat.h"
+#include "../cuda-sim/cuda-sim.h"
+
+#define RC_DEBUG 1
+#define MERGE_DEBUG 0
+
 
 #ifdef DRAM_VERIFY
 int PRINT_CYCLE = 0;
@@ -43,9 +50,54 @@ int PRINT_CYCLE = 0;
 template class fifo_pipeline<mem_fetch>;
 template class fifo_pipeline<dram_req_t>;
 
+dram_cmd::dram_cmd(int cmd, int from_bk, int to_bk, int from_ch, int to_ch, int from_subarray, int to_subarray, int pk_size, int app_ID, const struct memory_config * config) {
+    command = cmd;
+    from_bank = from_bk;
+    from_channel = from_ch;
+    from_sa = from_subarray;
+    to_sa = to_subarray;
+    to_bank = to_bk;
+    to_channel = to_ch;
+    size = pk_size;
+    appID = app_ID;
+    m_config = config;
+}
+
+dram_cmd::dram_cmd(int cmd, page * from_page, page * to_page, const struct memory_config * config)
+{
+    command = cmd;
+    appID = from_page->appID;
+    size = from_page->size;
+    new_addr_type from_addr = from_page->starting_addr;
+    addrdec_t from_raw_addr;
+
+    m_config = config;
+
+    m_config->m_address_mapping.addrdec_tlx(from_addr,&from_raw_addr, appID, DRAM_CMD, 0, 0);
+    from_channel = from_raw_addr.chip;
+    from_bank = from_raw_addr.bk;
+    from_sa = from_raw_addr.subarray;
+    if (to_page != NULL) {
+        new_addr_type to_addr = to_page->starting_addr;
+        addrdec_t to_raw_addr;
+        m_config->m_address_mapping.addrdec_tlx(to_addr,&to_raw_addr, appID, DRAM_CMD, 0, 0);
+        to_channel = to_raw_addr.chip;
+        to_bank = to_raw_addr.bk;
+        to_sa = to_raw_addr.subarray;
+    }
+    else
+    {
+        to_channel = from_channel;
+        to_bank = from_bank;
+        to_sa = from_sa;
+    }
+}
+
 dram_t::dram_t(unsigned int partition_id, const memory_config *config,
                memory_stats_t *stats, memory_partition_unit *mp,
-               gpgpu_sim *gpu) {
+               gpgpu_sim *gpu,
+               mmu * page_manager,
+               tlb_tag_array * shared_tlb) {
   id = partition_id;
   m_memory_partition_unit = mp;
   m_stats = stats;
@@ -68,6 +120,15 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   issued_total = 0;
   issued_total_row = 0;
   issued_total_col = 0;
+
+  compaction_bank_id = 0;  // not used
+  m_shared_tlb       = shared_tlb;
+  m_page_manager     = page_manager;
+  data_bus_busy      = 0;  // not used
+  for (unsigned i=0;i<=31;i++) {
+      mem_state_blp_alarm[i] = 0; // new
+      mem_state_blp_ncmd[i] = 0;
+  }
 
   CCDc = 0;
   RRDc = 0;
@@ -109,6 +170,8 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   for (unsigned i = 0; i < m_config->nbk; i++) {
     bk[i]->state = BANK_IDLE;
     bk[i]->bkgrpindex = i / (m_config->nbk / m_config->nbkgrp);
+    bk[i]->blocked = 0;
+    bk[i]->transfer = 0;
   }
   prio = 0;
 
@@ -121,7 +184,7 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
           : m_config->gpgpu_dram_return_queue_size);
   m_frfcfs_scheduler = NULL;
   if (m_config->scheduler_type == DRAM_FRFCFS)
-    m_frfcfs_scheduler = new frfcfs_scheduler(m_config, this, stats);
+    m_frfcfs_scheduler = new frfcfs_scheduler(m_config, this, stats, m_shared_tlb);
   n_cmd = 0;
   n_activity = 0;
   n_nop = 0;
@@ -133,9 +196,18 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   n_rd_L2_A = 0;
   n_req = 0;
   max_mrqs_temp = 0;
-  bwutil = 0;
   max_mrqs = 0;
   ave_mrqs = 0;
+  bwutil = 0;
+
+  n_cmd_blp = 0;
+  n_req = 0;
+  bwutil = 0;
+  bwutil_data = 0;
+  bwutil_tlb = 0;
+  n_cmd_blp = 0;
+  mem_state_blp = 0;
+  dram_cycles_active = 0;
 
   for (unsigned i = 0; i < 10; i++) {
     dram_util_bins[i] = 0;
@@ -156,6 +228,10 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
     mrqq_Dist = StatCreate("mrqq_length", 1, queue_limit());
   else                                             // queue length is unlimited;
     mrqq_Dist = StatCreate("mrqq_length", 1, 64);  // track up to 64 entries
+
+  for (unsigned i=0;i<m_config->nbk;i++) {
+      bk[i]->cmd_queue = new std::list<dram_cmd*>();
+  }
 }
 
 bool dram_t::full(bool is_write) const {
@@ -242,28 +318,44 @@ dram_req_t::dram_req_t(class mem_fetch *mf, unsigned banks,
 }
 
 void dram_t::push(class mem_fetch *data) {
-  assert(id == data->get_tlx_addr()
-                   .chip);  // Ensure request is in correct memory partition
-
-  dram_req_t *mrq =
-      new dram_req_t(data, m_config->nbk, m_config->dram_bnk_indexing_policy,
-                     m_memory_partition_unit->get_mgpu());
-
-  data->set_status(IN_PARTITION_MC_INTERFACE_QUEUE,
-                   m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-  mrqq->push(mrq);
-
-  // stats...
-  n_req += 1;
-  n_req_partial += 1;
-  if (m_config->scheduler_type == DRAM_FRFCFS) {
-    unsigned nreqs = m_frfcfs_scheduler->num_pending();
-    if (nreqs > max_mrqs_temp) max_mrqs_temp = nreqs;
+  if (mrqq->full()) {  // make sure that we have enough room to fill into the queue
+      wait_list.push_back(data);
   } else {
-    max_mrqs_temp = (max_mrqs_temp > mrqq->get_length()) ? max_mrqs_temp
-                                                         : mrqq->get_length();
+      if (data->get_page_fault()){  // Page not in DRAM
+          // This part is obsolete. TLB.cc handles this part
+          data->set_page_fault(false);
+          data->set_tlb_miss(false);
+      } else {  // TLB hit and page in DRAM
+          if (data->get_tlb_depth_count() == (unsigned)0 && data->get_wid() != (unsigned)-1){  //Only check if it is the actual requests, not TLB related request
+            assert(id == data->get_tlx_addr().chip);
+          }
+
+          dram_req_t *mrq = new dram_req_t(data, m_config->nbk, m_config->dram_bnk_indexing_policy,
+                                           m_memory_partition_unit->get_mgpu());
+          data->set_status(IN_PARTITION_MC_INTERFACE_QUEUE,
+                           m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+          mrqq->push(mrq);
+
+          n_req_partial += 1;
+
+          if (data->get_sid() != static_cast<unsigned>(-1)){
+              n_req += 1;
+          }
+          if (m_config->scheduler_type == DRAM_FRFCFS) {
+              unsigned nreqs = m_frfcfs_scheduler->num_pending();
+              if (nreqs > max_mrqs_temp) max_mrqs_temp = nreqs;
+          } else {
+              max_mrqs_temp = (max_mrqs_temp > mrqq->get_length()) ? max_mrqs_temp
+                                                                   : mrqq->get_length();
+          }
+          m_stats->memlatstat_dram_access(data);
+      }
   }
-  m_stats->memlatstat_dram_access(data);
+}
+
+void dram_t::insert_dram_command(dram_cmd * cmd)
+{
+    bk[cmd->to_bank]->cmd_queue->push_back(cmd);
 }
 
 void dram_t::scheduler_fifo() {
@@ -285,6 +377,12 @@ void dram_t::scheduler_fifo() {
   a ^= b;
 
 void dram_t::cycle() {
+  while (!mrqq->full() && !wait_list.empty()){
+      mem_fetch *temp = wait_list.front();
+      wait_list.pop_front();
+      push(temp);
+  }
+
   if (!returnq->full()) {
     dram_req_t *cmd = rwq->pop();
     if (cmd) {
@@ -300,7 +398,9 @@ void dram_t::cycle() {
                          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
         if (data->get_access_type() != L1_WRBK_ACC &&
             data->get_access_type() != L2_WRBK_ACC) {
-          data->set_reply();
+          if (data->get_parent_tlb_request() == nullptr) {
+              data->set_reply();
+          }
           returnq->push(data);
         } else {
           m_memory_partition_unit->set_done(data);
@@ -362,6 +462,7 @@ void dram_t::cycle() {
 
   for (unsigned j = 0; j < m_config->nbk; j++) {
     unsigned grp = get_bankgrp_number(j);
+
     if (bk[j]->mrq &&
         (((bk[j]->curr_row == bk[j]->mrq->row) && (bk[j]->mrq->rw == READ) &&
           (bk[j]->state == BANK_ACTIVE)))) {
@@ -576,9 +677,23 @@ bool dram_t::issue_col_command(int j) {
       else
         n_rd++;
 
-      bwutil += m_config->BL / m_config->data_command_freq_ratio;
-      bwutil_partial += m_config->BL / m_config->data_command_freq_ratio;
       bk[j]->n_access++;
+
+      // skip sanity_read
+      if (bk[j]->mrq->data->get_sid() != static_cast<unsigned>(-1)){
+          bwutil += m_config->BL / m_config->data_command_freq_ratio;
+          bwutil_partial += m_config->BL / m_config->data_command_freq_ratio;
+
+          if (bk[j]->mrq->data->get_tlb_depth_count() > 0){  //TLB-related data
+            bwutil_tlb += m_config->BL / m_config->data_command_freq_ratio;
+            bwutil_periodic_tlb += m_config->BL / m_config->data_command_freq_ratio;
+          } else {
+            bwutil_data += m_config->BL / m_config->data_command_freq_ratio;
+            bwutil_periodic_data += m_config->BL / m_config->data_command_freq_ratio;
+          }
+      } else {
+          abort();
+      }
 
 #ifdef DRAM_VERIFY
       PRINT_CYCLE = 1;
@@ -613,6 +728,15 @@ bool dram_t::issue_col_command(int j) {
         n_wr++;
       bwutil += m_config->BL / m_config->data_command_freq_ratio;
       bwutil_partial += m_config->BL / m_config->data_command_freq_ratio;
+
+      if (bk[j]->mrq->data->get_sid() != (unsigned)-1){
+          if (bk[j]->mrq->data->get_tlb_depth_count() > 0) {           //TLB-related data
+              bwutil_tlb += m_config->BL / m_config->data_command_freq_ratio;
+          } else {
+              bwutil_data += m_config->BL / m_config->data_command_freq_ratio;
+          }
+      }
+
 #ifdef DRAM_VERIFY
       PRINT_CYCLE = 1;
       printf("\tWR  Bk:%d Row:%03x Col:%03x \n", j, bk[j]->curr_row,
@@ -777,6 +901,7 @@ void dram_t::print(FILE *simFile) const {
   if (m_config->scheduler_type == DRAM_FRFCFS)
     fprintf(simFile, "mrqq: max=%d avg=%g\n", max_mrqs,
             (float)ave_mrqs / n_cmd);
+  fprintf(simFile, "/**********************************************************************/\n");
 }
 
 void dram_t::visualize() const {
@@ -855,7 +980,7 @@ void dram_t::visualizer_print(gzFile visualizer_file) {
 
 void dram_t::set_dram_power_stats(unsigned &cmd, unsigned &activity,
                                   unsigned &nop, unsigned &act, unsigned &pre,
-                                  unsigned &rd, unsigned &wr,
+                                  unsigned &rd, unsigned &wr, unsigned &wr_WB,
                                   unsigned &req) const {
   // Point power performance counters to low-level DRAM counters
   cmd = n_cmd;
@@ -865,6 +990,7 @@ void dram_t::set_dram_power_stats(unsigned &cmd, unsigned &activity,
   pre = n_pre;
   rd = n_rd;
   wr = n_wr;
+  wr_WB = n_wr_WB;
   req = n_req;
 }
 
@@ -877,4 +1003,51 @@ unsigned dram_t::get_bankgrp_number(unsigned i) {
   } else {
     assert(1);
   }
+  return 0; // we should never get here
 }
+
+void dram_t::set_miss(float m) {
+    miss_rate_d = m;
+}
+
+void dram_t::set_miss_core(float m, unsigned i)
+{
+    miss_rate_d_core[i] = m;
+}
+
+float dram_t::get_miss() {
+    return miss_rate_d;
+}
+
+unsigned dram_t::dram_bwutil_data() {
+    unsigned temp = bwutil_periodic_data;
+    bwutil_periodic_data = 0;
+    return temp;
+}
+/*
+unsigned dram_t::dram_bwutil_data(appid_t appid) {
+    // skip this function
+    return;
+} */
+
+unsigned dram_t::dram_bwutil_tlb() {
+    unsigned temp = bwutil_periodic_tlb;
+    bwutil_periodic_tlb = 0;
+    return temp;
+}
+/*
+unsigned dram_t::dram_bwutil_tlb(appid_t appid) {
+    // skip this function
+    return;
+} */
+
+unsigned dram_t::dram_bwutil() {
+    unsigned temp = bwutil_periodic;
+    bwutil_periodic = 0;
+    return temp;
+}
+/*
+unsigned dram_t::dram_bwutil(appid_t appid) {
+    // skip this function
+    return;
+} */

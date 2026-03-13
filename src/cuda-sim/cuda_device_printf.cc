@@ -29,6 +29,8 @@
 #include "cuda_device_printf.h"
 #include "ptx_ir.h"
 
+#define APP_ID 1
+
 void decode_space(memory_space_t &space, ptx_thread_info *thread,
                   const operand_info &op, memory_space *&mem, addr_t &addr);
 
@@ -88,7 +90,7 @@ void gpgpusim_cuda_vprintf(const ptx_instruction *pI, ptx_thread_info *thread,
     addr_t from_addr = actual_param_op.get_symbol()->get_address();
     unsigned long long buffer[1024];
     assert(size < 1024 * sizeof(unsigned long long));
-    thread->m_local_mem->read(from_addr, size, buffer);
+    thread->m_local_mem->read(from_addr, size, buffer, APP_ID);
     addr_t addr =
         (addr_t)buffer[0];  // should be pointer to generic memory location
     memory_space *mem = NULL;
@@ -99,16 +101,16 @@ void gpgpusim_cuda_vprintf(const ptx_instruction *pI, ptx_thread_info *thread,
       unsigned len = 0;
       char b = 0;
       do {  // figure out length
-        mem->read(addr + len, 1, &b);
+        mem->read(addr + len, 1, &b, APP_ID);
         len++;
       } while (b);
       fmtstr = (char *)malloc(len + 64);
-      for (int i = 0; i < len; i++) mem->read(addr + i, 1, fmtstr + i);
+      for (int i = 0; i < len; i++) mem->read(addr + i, 1, fmtstr + i, APP_ID);
       // mem->read(addr,len,fmtstr);
     } else {
       unsigned len = thread->get_finfo()->local_mem_framesize();
       arg_list = (char *)malloc(len + 64);
-      for (int i = 0; i < len; i++) mem->read(addr + i, 1, arg_list + i);
+      for (int i = 0; i < len; i++) mem->read(addr + i, 1, arg_list + i, APP_ID);
       // mem->read(addr,len,arg_list);
     }
   }
