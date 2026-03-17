@@ -1081,6 +1081,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     : gpgpu_t(config, ctx), m_config(config), m_memory_config(&config.m_memory_config),
     m_shader_config(&config.m_shader_config){
   gpgpu_ctx = ctx;
+  m_gpu_instance = this;
   m_shader_config = &m_config.m_shader_config;
   m_memory_config = &m_config.m_memory_config;
   ctx->ptx_parser->set_ptx_warp_size(m_shader_config);

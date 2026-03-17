@@ -68,8 +68,8 @@ void *gpgpu_sim_thread_sequential(void *ctx_ptr) {
       ctx->print_simulation_time();
 
       // reset cta scheduling, but not used because sequential execution is not used
-      ctx->the_gpgpusim->g_the_gpu->reset_cta_schedule();
-      ctx->the_gpgpusim->g_the_gpu->increase_sched_count();
+      //ctx->the_gpgpusim->g_the_gpu->reset_cta_schedule();
+      //ctx->the_gpgpusim->g_the_gpu->increase_sched_count();
     }
     sem_post(&(ctx->the_gpgpusim->g_sim_signal_finish));
   } while (!done);
@@ -84,7 +84,7 @@ static void termination_callback() {
 
 void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
   gpgpu_context *ctx = (gpgpu_context *)ctx_ptr;
-  atexit(termination_callback);
+  atexit(gpgpu_sim::exit_handle);
   // concurrent kernel execution simulation thread
   do {
     if (g_debug_execution >= 3) {
@@ -158,8 +158,8 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       ctx->print_simulation_time();
 
       // reset cta scheduling
-      ctx->the_gpgpusim->g_the_gpu->reset_cta_schedule();
-      ctx->the_gpgpusim->g_the_gpu->increase_sched_count();
+      //ctx->the_gpgpusim->g_the_gpu->reset_cta_schedule();
+      //ctx->the_gpgpusim->g_the_gpu->increase_sched_count();
     }
     pthread_mutex_lock(&(ctx->the_gpgpusim->g_sim_lock));
     ctx->the_gpgpusim->g_sim_active = false;

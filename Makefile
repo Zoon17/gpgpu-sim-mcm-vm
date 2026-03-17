@@ -210,7 +210,7 @@ cuda-sim: makedirs
 	$(MAKE) -C ./src/cuda-sim/ depend
 	$(MAKE) -C ./src/cuda-sim/
 
-TFLAGS = -std=c++0x -I$(CUDA_INSTALL_PATH)/include
+TFLAGS = -std=c++17 -I$(CUDA_INSTALL_PATH)/include
 ifneq ($(DEBUG),1)
 	TFLAGS += -O3
 endif

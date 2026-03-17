@@ -806,6 +806,14 @@ class gpgpu_sim : public gpgpu_t {
 
   // backward pointer
   class gpgpu_context *gpgpu_ctx;
+  static inline gpgpu_sim* m_gpu_instance = nullptr;
+  // print accumulated stats before exit
+  static void exit_handle() {
+      printf("GPGPU-Sim: *** exit detected ***\n");
+      if (m_gpu_instance) {
+          m_gpu_instance->print_stat_file(m_gpu_instance->last_streamID);
+      }
+  }
 
   void print_period_stat();
   void gpu_print_stat_file(unsigned long long streamID, FILE *outputfile);
