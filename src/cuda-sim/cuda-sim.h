@@ -42,6 +42,8 @@
 #include "../gpgpu-sim/shader.h"
 #include "ptx_sim.h"
 
+#define max_uint64 (~uint64_t{0})
+
 class gpgpu_context;
 class memory_space;
 class function_info;
@@ -55,6 +57,13 @@ enum PAGE_PLACEMENT {
   PAGE_STRIDE               =4,
   PAGE_ROW                  =5,
   PAGE_COLUMN               =6
+};
+
+enum BLOCK_STATUS {
+    UNMAPPED               = 0,
+    MAPPED_BEFORE_DECISION = 1,
+    MAPPED_AFTER_DECISION  = 2,
+    MAPPED_BROKEN          = 3
 };
 
 extern const char *g_gpgpusim_version_string;
@@ -116,7 +125,10 @@ public:
     void print();
 
     void* translate(uint64_t ID, void* vaddr, unsigned chiplet);
+    void* translate(void* vaddr);
     void mapping_pages(uint64_t vpn, unsigned int page_size, unsigned int chiplet);
+    void mapping_pages_reservation(uint64_t vpn, unsigned int page_size, unsigned int chiplet, bool decision);
+    void mapping_pages_profiling(uint64_t vpn, unsigned int page_size, unsigned int chiplet);
     bool check_mapping(uint64_t vpn);  // check whether a page is mapped to GPU memory
 
     void modify_mapping(bool adding, bool promotion, uint64_t ID, uint64_t vaddr, uint64_t paddr,
@@ -125,6 +137,9 @@ public:
     uint64_t get_malloc_num_pages(unsigned malloc_num);
     unsigned get_malloc(uint64_t base_addr);
     unsigned get_tot_malloc_num();
+    unsigned get_malloc_decision(unsigned malloc_num);
+    unsigned get_block_status(uint64_t block_vpn) const;
+    void update_profiling(uint64_t vpn, unsigned chiplet);
     float get_malloc_remote_ratio(unsigned malloc_num);
     unsigned get_map_chiplet(uint64_t vpn);
     void copy_alloc_result(unsigned & total_result, std::vector<unsigned> & chiplet_result);

@@ -78,7 +78,7 @@ void page_table::parse_bitmask() {
     // set page table offset mask
     new_addr_type total_offset = (new_addr_type)511;  // 9-bit mask
     new_addr_type offset_shift = (static_cast<new_addr_type>(current_level - 1)
-        * static_cast<new_addr_type>(9)) + static_cast<new_addr_type>(12);  // page table level shift + page offset shift, shift hard coded
+        * static_cast<new_addr_type>(9)) + static_cast<new_addr_type>(PAGE_OFFSET);  // page table level shift + page offset shift, shift hard coded
     m_pt_offset_shift = offset_shift;
     m_pt_offset_mask = (new_addr_type)(total_offset << offset_shift);
     printf("Page table offset shift = %lld, offset mask = %llx\n", m_pt_offset_shift, m_pt_offset_mask);

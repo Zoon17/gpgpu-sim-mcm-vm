@@ -25,6 +25,7 @@ These are the key options for the virtual memory subsystem. For detailed informa
 To simulate a baseline MCM GPU where the CTA scheduling policy and memory mapping remain similar to those of a non-MCM GPU, please update the configurations in the `gpgpusim.config` file as follows:
 
 ```bash
+-enable_mem_reserved 0
 -mcm_cta_schedule 0
 -mcm_data_schedule 2
 -gpgpu_memory_partition_indexing 6
@@ -44,6 +45,7 @@ These configurations implement locality-aware policies based on the concepts pre
 The Kernel-wide scheduling option provides a simpler approach that typically performs well for regular GPU kernels. Other options, such as Align-aware, Column-based, and Row-based scheduling, require specific granularity inputs (e.g., the column size of the data structure for column-based mapping).
 
 ```bash
+-enable_mem_reserved 0
 -mcm_cta_schedule 2
 -mcm_data_schedule 2
 -gpgpu_memory_partition_indexing 5
@@ -57,9 +59,40 @@ These configurations implement a locality-aware policy based on the concepts pre
 The policy places data near the chiplet that initially requests it (first-touch-based). While this differs from conventional GPU memory mapping where all required data is copied before kernel execution, it performs consistently well across both regular and irregular GPU kernels.
 
 ```bash
+-enable_mem_reserved 0
 -mcm_cta_schedule 1
 -mcm_data_schedule 1
 -gpgpu_memory_partition_indexing 5
+```
+
+
+## Reservation-Based Memory Mapping Settings
+
+Enable reservation-based memory mapping. Pages are mapped using the configured mapping granularity (e.g., 64 KB), regardless of the target page size (e.g., 2 MB). Subpages are promoted to a page of the target size once all of them are mapped.
+
+### Baseline
+
+```bash
+-enable_mem_reserved 1
+-mapping_granularity 16  # Fixed, 16 = 64KB
+-set_page_size 512  # Target page size: 16 = 64KB, 512 = 2MB
+-mcm_cta_schedule 1
+-mcm_data_schedule 1
+-gpgpu_memory_partition_indexing 5
+```
+
+### Profiling-Based Memory Mapping
+
+Profile memory mapping to find a suitable page size that reduces remote memory accesses while maximizing page size (**[Chiplet-Locality-Aware Page Placement](https://dl.acm.org/doi/10.1145/3725843.3756090)**).
+
+```bash
+-enable_mem_reserved 1
+-mapping_granularity 16  # Fixed, 16 = 64 KB
+-set_page_size 512  # Fixed for profiling
+-mcm_cta_schedule 1
+-mcm_data_schedule 1
+-gpgpu_memory_partition_indexing 5
+-enable_profiling 1
 ```
 
 ## Scaling the Number of Chiplets
@@ -88,7 +121,7 @@ Use the following configurations to adjust the number of chiplets for the simula
 -DRAM_size 34359738368  ## 32GB
 ```
 
-### 8-Chiplet Configuration
+### 16-Chiplet Configuration
 
 ```bash
 -chiplet_num 16

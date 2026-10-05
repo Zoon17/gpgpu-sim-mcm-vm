@@ -23,6 +23,10 @@
 #define SHARED_SPACE 2
 #define OTHER_SPACE 3
 
+#define PAGE_OFFSET 12
+#define COALESCING 16
+#define COALESCING_SHIFT 4
+
 class PageWalker;
 class PageWalkSubsystem;
 class mem_fetch;
@@ -54,6 +58,11 @@ enum page_mode_status {
   PAGE_2M  = 512,
 };
 
+enum page_mode_shift {
+  PAGE_64K_SHIFT = 4,
+  PAGE_2M_SHIFT  = 9,
+};
+
 class tlb_tag_array{
 private:
     unsigned m_tot_chiplet     = -1;  // tot chiplet num
@@ -77,6 +86,38 @@ private:
     };
     std::list<tlb_entry>* tag_array;
     std::list<tlb_entry>** l2_tag_array;
+
+    struct coal_entry {  // coalesced TLB entry
+        new_addr_type m_tag;
+        new_addr_type m_shift;
+        unsigned m_page_size;
+
+        new_addr_type m_vir_phy_offset;
+        std::bitset<COALESCING> m_valid_bitset;
+        coal_entry() {
+            m_tag       = 0;
+            m_shift     = 0;
+            m_page_size = 0;
+            m_vir_phy_offset = 0;
+            m_valid_bitset.reset();
+        }
+        coal_entry(new_addr_type tag_in, new_addr_type shift_in, unsigned page_size_in) :
+            m_tag(tag_in), m_shift(shift_in), m_page_size(page_size_in) {
+            m_vir_phy_offset = 0;
+            m_valid_bitset.reset();
+        }
+        coal_entry(new_addr_type tag_in, new_addr_type shift_in, unsigned page_size_in, new_addr_type offset_in,
+            std::bitset<COALESCING> bitset_in) :
+            m_tag(tag_in), m_shift(shift_in), m_page_size(page_size_in), m_vir_phy_offset(offset_in) {
+            for (unsigned i = 0; i < static_cast<unsigned>(COALESCING); i++){
+                m_valid_bitset[i] = bitset_in[i];
+            }
+        }
+    };
+
+    std::list<coal_entry>* coal_tag_array;
+    std::list<coal_entry>** coal_l2_tag_array;
+
     mshr_table m_mshrs;
 
     typedef std::unordered_map<new_addr_type, unsigned> page_map;
@@ -125,8 +166,11 @@ public:
 
     enum tlb_request_status probe(new_addr_type addr,
                                   unsigned accessor, mem_fetch * mf);
+    enum tlb_request_status probe_coalescing(new_addr_type addr,
+                                  unsigned accessor, mem_fetch * mf);
     enum tlb_request_status probe(new_addr_type addr, mem_fetch * mf, unsigned chiplet);  // TLB probe with chiplet ID
     enum tlb_request_status probe(new_addr_type addr, mem_fetch * mf);  // TLB probe with chiplet ID
+    enum tlb_request_status probe_coalescing(new_addr_type addr, mem_fetch * mf);  // TLB probe with chiplet ID
 
     bool access(tlb_fetch* tf, unsigned chiplet);  // L2 TLB access in MCM GPUs
 
@@ -138,7 +182,10 @@ public:
     void set_l1_tlb(int coreID, tlb_tag_array* l1, unsigned chiplet);  // set L1 TLB for per-chiplet L2 TLB
 
     void fill(new_addr_type addr, mem_fetch* mf);
+    void fill(new_addr_type addr, new_addr_type coal_offset,
+        std::bitset<COALESCING> coal_bitset, mem_fetch* mf);
     void fill(new_addr_type addr, unsigned accessor, mem_fetch* mf);
+    void fill_coalescing(new_addr_type addr, unsigned accessor, mem_fetch* mf);
 
     std::deque<mem_fetch*>** get_tlb_return_queue() { return tlb_return_queue; }
     bool request_shared_tlb(new_addr_type addr, unsigned accessor, mem_fetch* mf);
@@ -146,6 +193,8 @@ public:
     /* L2 TLB specific methods */
     void cycle();  // L2 TLB access handle for MCM GPUs
     void fill_into_l1_tlb(new_addr_type addr, mem_fetch* mf);
+    void fill_into_l1_tlb(new_addr_type addr, new_addr_type coal_offset,
+        std::bitset<COALESCING> coal_bitset, mem_fetch* mf);
     void l2_fill(new_addr_type addr, unsigned accessor, mem_fetch* mf);
 
     tlb_tag_array* get_shared_tlb() {
@@ -168,12 +217,16 @@ public:
     unsigned get_tlb_index(new_addr_type key);
 
     unsigned record_page_size(new_addr_type key, unsigned chiplet, unsigned page_mode);
+    void update_page_size(new_addr_type key, unsigned chiplet, unsigned page_mode);
     unsigned get_page_size(new_addr_type key);
 
     void debug();
 
     // shared tlb update
     unsigned get_tlb_chiplet(new_addr_type key);
+
+    // TLB coalescing
+    new_addr_type probe_contiguity(new_addr_type key, std::bitset<COALESCING> &coal_bitset);
 
     // TLB shootdwon
     void flush_TLBs(uint64_t vpn_chunk);

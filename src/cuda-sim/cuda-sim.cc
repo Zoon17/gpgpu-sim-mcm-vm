@@ -3097,9 +3097,6 @@ void functionalCoreSim::warp_exit(unsigned warp_id) {
   }
 }
 
-
-#define max_uint64 (~uint64_t{0})
-
 // interface for physical memory manager
 class Abstract_PMM {
 public:
@@ -3238,6 +3235,11 @@ class PMM : public Abstract_PMM {
     typedef std::vector<std::deque<uint64_t> *> chiplet_reserved_chunks;
     std::unordered_map<unsigned, chiplet_reserved_chunks *> mem_reserved_chunks;
 
+    typedef std::unordered_map<uint64_t, std::map<uint64_t, std::pair<unsigned, uint64_t>> *> chiplet_block_reserved_chunks;
+    std::unordered_map<unsigned, chiplet_block_reserved_chunks *> mem_block_reserved_chunks;
+
+    std::unordered_map<uint64_t, unsigned> block_map;
+
     unsigned total_pages_alloc = 0;
     std::vector<unsigned> chiplet_page_alloc;
     std::unordered_map<new_addr_type, unsigned> chiplet_page_alloc_map;
@@ -3286,6 +3288,7 @@ public:
         }
 
         mem_reserved_chunks.clear();
+        mem_block_reserved_chunks.clear();
         for (unsigned i = 1; i <= 512; i = i * 2) {
             auto * multi_chunk = new chiplet_reserved_chunks;
             for (auto c = 0; c < chiplet; c++){
@@ -3294,7 +3297,12 @@ public:
             }
             mem_reserved_chunks.insert(std::pair<unsigned, chiplet_reserved_chunks *>
                                            (i, multi_chunk));
+
+            auto * multi_block_chunk = new chiplet_block_reserved_chunks;
+            mem_block_reserved_chunks.insert(std::pair<unsigned, chiplet_block_reserved_chunks *>(i, multi_block_chunk));
         }
+
+        block_map.clear();
 
         chiplet_page_alloc.assign(chiplet, 0);
         chiplet_page_alloc_map.clear();
@@ -3352,7 +3360,7 @@ public:
                     total_pages_alloc++;
                     chiplet_page_alloc[chiplet] += 1;
                     if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
-                        unsigned malloc_num = hub->get_malloc(vpn << 12);
+                        unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
                         malloc_chiplet_page_alloc[malloc_num][chiplet] += 1;
                     }
                     chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, chiplet));  // store key:chiplet pair
@@ -3362,13 +3370,11 @@ public:
                         chiplet_free_large_chunks[chiplet].pop_back();
 
                         for (unsigned  i = 0; i < 512; i++){
-                          uint64_t get_sub_page = chiplet_free_chunks[chiplet].back();
-                          chiplet_free_chunks[chiplet].pop_back();
-
-                          uint64_t chunk_number = (uint64_t)(get_sub_page / static_cast<uint64_t>(512));
-                          assert(get_chunk == chunk_number);
-
-                          get_queue->push_front(get_sub_page);
+                            uint64_t get_sub_page = chiplet_free_chunks[chiplet].back();
+                            chiplet_free_chunks[chiplet].pop_back();
+                            uint64_t chunk_number = (uint64_t)(get_sub_page / static_cast<uint64_t>(512));
+                            assert(get_chunk == chunk_number);
+                            get_queue->push_front(get_sub_page);
                         }
 
                         uint64_t get_page = get_queue->back();
@@ -3381,7 +3387,7 @@ public:
                         total_pages_alloc++;
                         chiplet_page_alloc[chiplet] += 1;
                         if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
-                            unsigned malloc_num = hub->get_malloc(vpn << 12);
+                            unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
                             malloc_chiplet_page_alloc[malloc_num][chiplet] += 1;
                         }
                         chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, chiplet));  //  store key:chiplet pair
@@ -3395,6 +3401,261 @@ public:
             if (vpn == first_vpn) {
                 assert(virtual_offset == 0);
                 chunk->add_page(info, page_mode);
+
+                if (m_mem_config->enable_mem_reserved && m_mem_config->enable_profiling) {
+                    hub->update_profiling(vpn, chiplet);
+                }
+            }
+        }
+        pages_allocated += num_pages;
+    }
+
+    void allocate_reserved(uint64_t ID, uint64_t first_vpn, uint64_t num_pages, uint64_t block_vpn, unsigned chiplet,
+        unsigned page_mode, bool &promotion_flag, bool decision_flag) {
+        uint64_t va_block_vpn = first_vpn >> static_cast<uint64_t>(PAGE_2M_SHIFT);
+        auto find = block_map.find(va_block_vpn);  // shift hard coded
+        if (find == block_map.end()) {
+            unsigned block_flag = decision_flag ? MAPPED_AFTER_DECISION : MAPPED_BEFORE_DECISION;
+            block_map.insert(std::pair<uint64_t, unsigned>(va_block_vpn, block_flag));
+        }
+        if (page_mode == PAGE_64K) return this->allocate(ID, first_vpn, num_pages, chiplet, page_mode);  // no reservation required for 64KB page mapping
+
+        if (ID_to_data[ID] == nullptr) ID_to_data[ID] = new Vspace_Data();
+        Vspace_Data* data = ID_to_data[ID];
+        for (uint64_t vpn = first_vpn; vpn < first_vpn + num_pages; ++vpn) {
+            assert(huge_page_size == 1);  // set page allocate chunk unit to 4KB base page
+            const uint64_t vcn = vpn / huge_page_size; // same as vpn, 4KB base chunk, virtual chunk number
+            const uint64_t hps = huge_page_size;  // same as 1
+            const uint64_t virtual_offset = vpn % huge_page_size;
+            assert(hps == 1);
+            unsigned target_chiplet = chiplet;
+            Virtual_Chunk* chunk = data->virt_to_phys[vcn];
+            if (chunk == nullptr) {
+                chiplet_block_reserved_chunks* get_reserved_blocks = mem_block_reserved_chunks.at(page_mode);
+                if (get_reserved_blocks->find(block_vpn) == get_reserved_blocks->end()) {  // there is no reserved block
+                    // reserve pages for the block
+                    auto block_reserved_pages = new std::map<uint64_t, std::pair<unsigned, uint64_t>>;
+                    std::deque<uint64_t> * get_queue = mem_reserved_chunks.at(page_mode)->at(target_chiplet);
+                    assert(get_queue != nullptr);
+                    if (!get_queue->empty()){
+                        for (uint64_t i = 0; i < page_mode; i++) {
+                            uint64_t get_page = get_queue->back();
+                            get_queue->pop_back();
+                            block_reserved_pages->insert(std::pair<uint64_t, std::pair<unsigned, uint64_t>>
+                              (i, std::pair<unsigned, uint64_t>(target_chiplet, get_page)));
+                        }
+                    } else {
+                        assert(!chiplet_free_large_chunks[target_chiplet].empty());
+                        uint64_t get_chunk = chiplet_free_large_chunks[target_chiplet].back();
+                        chiplet_free_large_chunks[target_chiplet].pop_back();
+
+                        for (unsigned  i = 0; i < 512; i++){
+                            uint64_t get_sub_page = chiplet_free_chunks[target_chiplet].back();
+                            chiplet_free_chunks[target_chiplet].pop_back();
+                            uint64_t chunk_number = (uint64_t)(get_sub_page / static_cast<uint64_t>(512));
+                            assert(get_chunk == chunk_number);
+                            get_queue->push_front(get_sub_page);
+                        }
+
+                        for (uint64_t i = 0; i < page_mode; i++) {
+                            uint64_t get_page = get_queue->back();
+                            get_queue->pop_back();
+                            block_reserved_pages->insert(std::pair<uint64_t, std::pair<unsigned, uint64_t>>
+                              (i, std::pair<unsigned, uint64_t>(target_chiplet, get_page)));
+                        }
+                    }
+                    get_reserved_blocks->insert(std::pair<uint64_t, std::map<uint64_t, std::pair<unsigned, uint64_t>> *>
+                      (block_vpn, block_reserved_pages));
+
+                    uint64_t page_number = vpn % block_vpn;
+                    assert(page_number < page_mode);
+                    uint64_t get_page = block_reserved_pages->at(page_number).second;
+                    block_reserved_pages->erase(page_number);
+                    chunk = new Virtual_Chunk(hps, vcn * hps * hub->get_page_size(), get_page);
+
+                    total_pages_alloc++;
+                    chiplet_page_alloc[target_chiplet] += 1;
+                    if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+                        unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
+                        malloc_chiplet_page_alloc[malloc_num][target_chiplet] += 1;
+                    }
+                    chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, target_chiplet));  // store key:chiplet pair
+
+                    if (block_reserved_pages->empty()) {
+                        if (page_mode == PAGE_2M) {  // all the subpages are mapped, page size promotion
+                            //data->virt_to_phys[block_vpn]->add_page(info, page_mode);  // page walkers automatically detect 2MB pages
+                            promotion_flag = true;
+                        }
+                        delete block_reserved_pages;
+                    }
+                } else {
+                    auto block_reserved_pages = get_reserved_blocks->at(block_vpn);
+                    uint64_t page_number = vpn % block_vpn;
+                    assert(page_number < page_mode);
+                    target_chiplet = block_reserved_pages->at(page_number).first;
+                    uint64_t get_page = block_reserved_pages->at(page_number).second;
+                    block_reserved_pages->erase(page_number);
+                    chunk = new Virtual_Chunk(hps, vcn * hps * hub->get_page_size(), get_page);
+
+                    total_pages_alloc++;
+                    chiplet_page_alloc[target_chiplet] += 1;
+                    if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+                        unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
+                        malloc_chiplet_page_alloc[malloc_num][target_chiplet] += 1;
+                    }
+                    chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, target_chiplet));  // store key:chiplet pair
+
+                    if (block_reserved_pages->empty()) {
+                        if (page_mode == PAGE_2M) {  // all the subpages are mapped, page size promotion
+                            //data->virt_to_phys[block_vpn]->add_page(info, page_mode);  // page walkers automatically detect 2MB pages
+                            promotion_flag = true;
+                        }
+                        delete block_reserved_pages;
+                    }
+                }
+                data->virt_to_phys[vcn] = chunk;
+                chunk->mark_page();
+            }
+            Log_Info info = Log_Info(ID, hub, target_chiplet);
+            if (vpn == first_vpn) {
+                assert(virtual_offset == 0);
+                chunk->add_page(info, num_pages);
+
+                if (m_mem_config->enable_mem_reserved && m_mem_config->enable_profiling) {
+                    hub->update_profiling(vpn, target_chiplet);
+                }
+            }
+        }
+        pages_allocated += num_pages;
+    }
+
+    void allocate_profiling(uint64_t ID, uint64_t first_vpn, uint64_t num_pages, uint64_t block_vpn, unsigned chiplet,
+        unsigned page_mode, bool &promotion_flag) {
+        uint64_t va_block_vpn = first_vpn >> static_cast<uint64_t>(PAGE_2M_SHIFT);
+        auto find = block_map.find(va_block_vpn);  // shift hard coded
+        if (find == block_map.end()) {
+            block_map.insert(std::pair<uint64_t, unsigned>(va_block_vpn, MAPPED_BEFORE_DECISION));
+        } else {
+            assert(find->second == MAPPED_BEFORE_DECISION);
+        }
+        assert(page_mode == PAGE_2M);
+
+        if (ID_to_data[ID] == nullptr) ID_to_data[ID] = new Vspace_Data();
+        Vspace_Data* data = ID_to_data[ID];
+        for (uint64_t vpn = first_vpn; vpn < first_vpn + num_pages; ++vpn) {
+            assert(huge_page_size == 1);  // set page allocate chunk unit to 4KB base page
+            const uint64_t vcn = vpn / huge_page_size; // same as vpn, 4KB base chunk, virtual chunk number
+            const uint64_t hps = huge_page_size;  // same as 1
+            const uint64_t virtual_offset = vpn % huge_page_size;
+            assert(hps == 1);
+            unsigned target_chiplet = chiplet;
+            Virtual_Chunk* chunk = data->virt_to_phys[vcn];
+            if (chunk == nullptr) {
+                chiplet_block_reserved_chunks* get_reserved_blocks = mem_block_reserved_chunks.at(page_mode);
+                if (get_reserved_blocks->find(block_vpn) == get_reserved_blocks->end()) {  // there is no reserved block
+                    // reserve pages for the block
+                    auto block_reserved_pages = new std::map<uint64_t, std::pair<unsigned, uint64_t>>;
+                    std::deque<uint64_t> * get_queue = mem_reserved_chunks.at(page_mode)->at(target_chiplet);
+                    assert(get_queue != nullptr);
+                    if (!get_queue->empty()){
+                        for (uint64_t i = 0; i < page_mode; i++) {
+                            uint64_t get_page = get_queue->back();
+                            get_queue->pop_back();
+                            block_reserved_pages->insert(std::pair<uint64_t, std::pair<unsigned, uint64_t>>
+                              (i, std::pair<unsigned, uint64_t>(target_chiplet, get_page)));
+                        }
+                    } else {
+                        assert(!chiplet_free_large_chunks[target_chiplet].empty());
+                        uint64_t get_chunk = chiplet_free_large_chunks[target_chiplet].back();
+                        chiplet_free_large_chunks[target_chiplet].pop_back();
+
+                        for (unsigned  i = 0; i < 512; i++){
+                            uint64_t get_sub_page = chiplet_free_chunks[target_chiplet].back();
+                            chiplet_free_chunks[target_chiplet].pop_back();
+                            uint64_t chunk_number = (uint64_t)(get_sub_page / static_cast<uint64_t>(512));
+                            assert(get_chunk == chunk_number);
+                            get_queue->push_front(get_sub_page);
+                        }
+
+                        for (uint64_t i = 0; i < page_mode; i++) {
+                            uint64_t get_page = get_queue->back();
+                            get_queue->pop_back();
+                            block_reserved_pages->insert(std::pair<uint64_t, std::pair<unsigned, uint64_t>>
+                              (i, std::pair<unsigned, uint64_t>(target_chiplet, get_page)));
+                        }
+                    }
+                    get_reserved_blocks->insert(std::pair<uint64_t, std::map<uint64_t, std::pair<unsigned, uint64_t>> *>
+                      (block_vpn, block_reserved_pages));
+
+                    uint64_t page_number = vpn % block_vpn;
+                    assert(page_number < page_mode);
+                    uint64_t get_page = block_reserved_pages->at(page_number).second;
+                    block_reserved_pages->erase(page_number);
+                    chunk = new Virtual_Chunk(hps, vcn * hps * hub->get_page_size(), get_page);
+
+                    total_pages_alloc++;
+                    chiplet_page_alloc[target_chiplet] += 1;
+                    if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+                        unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
+                        malloc_chiplet_page_alloc[malloc_num][target_chiplet] += 1;
+                    }
+                    chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, target_chiplet));  // store key:chiplet pair
+
+                    if (block_reserved_pages->empty()) {
+                        if (page_mode == PAGE_2M) {  // all the subpages are mapped, page size promotion
+                            //data->virt_to_phys[block_vpn]->add_page(info, page_mode);  // page walkers automatically detect 2MB pages
+                            promotion_flag = true;
+                        }
+                        delete block_reserved_pages;
+                    }
+                } else {
+                    auto block_reserved_pages = get_reserved_blocks->at(block_vpn);
+                    // need to check whether current chiplet != previous chiplet
+                    uint64_t page_number = vpn % block_vpn;
+                    assert(page_number < page_mode);
+                    unsigned prev_chiplet = block_reserved_pages->at(page_number).first;
+                    if (prev_chiplet != target_chiplet) {
+                        block_map[va_block_vpn] = MAPPED_BROKEN;
+                        for (auto iter = block_reserved_pages->begin(); iter != block_reserved_pages->end(); ++iter) {
+                            assert(static_cast<unsigned>(block_reserved_pages->size()) % num_pages == 0);
+                            uint64_t get_page = iter->second.second;
+                            std::deque<uint64_t> *get_queue = mem_reserved_chunks.at(num_pages)->at(prev_chiplet);
+                            get_queue->push_front(get_page);
+                        }
+                        delete block_reserved_pages;
+                        return allocate_reserved(ID, first_vpn, num_pages, first_vpn, target_chiplet, num_pages, promotion_flag, false);
+                    }
+
+                    uint64_t get_page = block_reserved_pages->at(page_number).second;
+                    block_reserved_pages->erase(page_number);
+                    chunk = new Virtual_Chunk(hps, vcn * hps * hub->get_page_size(), get_page);
+
+                    total_pages_alloc++;
+                    chiplet_page_alloc[target_chiplet] += 1;
+                    if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
+                        unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
+                        malloc_chiplet_page_alloc[malloc_num][target_chiplet] += 1;
+                    }
+                    chiplet_page_alloc_map.insert(std::pair<new_addr_type, unsigned>(vpn, target_chiplet));  // store key:chiplet pair
+
+                    if (block_reserved_pages->empty()) {
+                        if (page_mode == PAGE_2M) {  // all the subpages are mapped, page size promotion
+                            //data->virt_to_phys[block_vpn]->add_page(info, page_mode);  // page walkers automatically detect 2MB pages
+                            promotion_flag = true;
+                        }
+                        delete block_reserved_pages;
+                    }
+                }
+                data->virt_to_phys[vcn] = chunk;
+                chunk->mark_page();
+            }
+            Log_Info info = Log_Info(ID, hub, target_chiplet);
+            if (vpn == first_vpn) {
+                assert(virtual_offset == 0);
+                chunk->add_page(info, num_pages);
+                if (m_mem_config->enable_mem_reserved && m_mem_config->enable_profiling) {
+                    hub->update_profiling(vpn, target_chiplet);
+                }
             }
         }
         pages_allocated += num_pages;
@@ -3462,13 +3723,23 @@ public:
         chiplet_page_alloc[chiplet] -= 1;
         chiplet_page_alloc_map.erase(vpn);
         if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
-            unsigned malloc_num = hub->get_malloc(vpn << 12);
+            unsigned malloc_num = hub->get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
             malloc_chiplet_page_alloc[malloc_num][chiplet] -= 1;
         }
         data->virt_to_phys.erase(vcn);
         //data->reserved_chunks.erase(vchunk);
         delete vchunk;
         pages_freed += num_pages;
+    }
+
+    unsigned get_block_status(const uint64_t block_vpn) {
+      auto find = block_map.find(block_vpn);
+      if (find == block_map.end()) {
+          return UNMAPPED;
+      } else {
+          const unsigned status = block_map.at(block_vpn);
+          return status;
+      }
     }
 };
 
@@ -3521,10 +3792,96 @@ class VMM : public Abstract_VMM {
     std::list<virtual_range> malloc_list;
     std::unordered_map<unsigned, uint64_t> malloc_num_pages;
     uint64_t max_byte = 0;
+    std::unordered_map<unsigned, unsigned> malloc_page_decision_done;
 
     bool sched_list_setup = false;
     std::list<uint64_t> * data_sched_list;
     std::list<uint64_t> * data_batch_list;
+
+    struct page_node {
+        unsigned m_mapped_chiplet = 0;
+        std::vector<unsigned> m_leaf_page_node_info;
+
+        page_node* m_left_node  = nullptr;
+        page_node* m_right_node = nullptr;
+
+        unsigned m_leaf_update_cnt = 0;
+        unsigned m_tot_leaf_page_cnt = 0;
+
+        float m_chiplet_score = 0.0f;
+    };
+
+    class va_block_tree {
+    public:
+        int m_leaf_index;
+        std::vector<page_node> m_block_tree;
+
+        va_block_tree(const int num_node, const unsigned tot_chiplet_num) : m_block_tree(num_node) {
+            for (int i = 0; i < num_node; i++) {
+                m_block_tree[i].m_mapped_chiplet = -1;
+                m_block_tree[i].m_leaf_page_node_info.assign(tot_chiplet_num, 0);
+                m_block_tree[i].m_leaf_update_cnt = 0;
+                m_block_tree[i].m_chiplet_score = 0.0f;
+            }
+
+            m_leaf_index = (((num_node) - 1) / 2);
+            for (int i = m_leaf_index; i < num_node; i++) {
+                m_block_tree[i].m_tot_leaf_page_cnt = 1;
+            }
+
+            for (int i = m_leaf_index - 1; i >= 0; i--) {
+                m_block_tree[i].m_left_node  = &m_block_tree[2 * i + 1];
+                m_block_tree[i].m_right_node = &m_block_tree[2 * i + 2];
+
+                unsigned left_leaf  = (m_block_tree[i].m_left_node) ? m_block_tree[i].m_left_node->m_tot_leaf_page_cnt : 0;
+                unsigned right_leaf = (m_block_tree[i].m_right_node) ? m_block_tree[i].m_right_node->m_tot_leaf_page_cnt : 0;
+                m_block_tree[i].m_tot_leaf_page_cnt = left_leaf + right_leaf;
+            }
+        }
+
+        void update_leaf_page(const unsigned index, const unsigned chiplet) {
+            const int page_index = m_leaf_index + static_cast<int>(index);
+            assert(page_index < m_block_tree.size());
+            m_block_tree[page_index].m_mapped_chiplet = chiplet;
+            m_block_tree[page_index].m_chiplet_score = 1.0f;
+            const int parent_index = (page_index - 1) / 2;
+            assert(m_block_tree[parent_index].m_left_node && m_block_tree[parent_index].m_right_node);
+            propagate_update(parent_index, chiplet);
+        }
+
+        void propagate_update(const unsigned index, const unsigned chiplet) {
+            m_block_tree[index].m_leaf_update_cnt++;
+            m_block_tree[index].m_leaf_page_node_info[chiplet]++;
+            if (m_block_tree[index].m_leaf_update_cnt == m_block_tree[index].m_tot_leaf_page_cnt) {
+                compute_score(index);
+            }
+            if (index != 0) {
+                const unsigned parent_index = (index - 1) / 2;
+                assert(m_block_tree[parent_index].m_left_node && m_block_tree[parent_index].m_right_node);
+                propagate_update(parent_index, chiplet);
+            }
+        }
+
+        void compute_score(const unsigned index) {
+            const unsigned chiplet_num = m_block_tree[index].m_leaf_page_node_info.size();
+            //unsigned max_chiplet = 0;
+            unsigned max_cnt = 0;
+            unsigned leaf_cnt = 0;
+
+            for (unsigned i = 0; i < chiplet_num; i++) {
+                leaf_cnt += m_block_tree[index].m_leaf_page_node_info[i];
+                if (m_block_tree[index].m_leaf_page_node_info[i] > max_cnt) {
+                    max_cnt = m_block_tree[index].m_leaf_page_node_info[i];
+                    //max_chiplet = i;
+                }
+            }
+            assert(leaf_cnt == m_block_tree[index].m_tot_leaf_page_cnt);
+            m_block_tree[index].m_chiplet_score = static_cast<float>(max_cnt) / static_cast<float>(leaf_cnt);
+        }
+    };
+
+    typedef std::unordered_map<uint64_t, va_block_tree *> malloc_tree;
+    std::unordered_map<unsigned, malloc_tree *> profiling_tree;
 
 public:
     VMM(Hub* h, uint64_t _ID, const memory_config* config, mmu* get_mmu) : used_ranges(), free_ranges() {
@@ -3540,10 +3897,13 @@ public:
         malloc_cnt = 0;
         malloc_list.clear();
         malloc_num_pages.clear();
+        malloc_page_decision_done.clear();
 
         sched_list_setup = false;
         data_sched_list  = new std::list<uint64_t>;
         data_batch_list  = new std::list<uint64_t>;
+
+        profiling_tree.clear();
     }
 
     unsigned get_malloc(uint64_t base_addr) {
@@ -3565,6 +3925,16 @@ public:
 
     unsigned get_tot_malloc_num() {
         return malloc_cnt;
+    }
+
+    unsigned get_malloc_decision(unsigned malloc_num) {
+        auto find = malloc_page_decision_done.find(malloc_num);
+        if (find == malloc_page_decision_done.end()) {
+            return 0;
+        } else {
+            unsigned decided_size = malloc_page_decision_done.at(malloc_num);
+            return decided_size;
+        }
     }
 
     void print() {
@@ -3645,6 +4015,10 @@ public:
         uint64_t base_vpn  = allocated_range.start / (uint64_t)hub->get_page_size();
         uint64_t num_pages = (allocated_range.end - allocated_range.start) / (uint64_t)hub->get_page_size();
         malloc_num_pages.insert(std::pair<unsigned, uint64_t>(malloc_cnt, num_pages));
+        if (m_config->enable_profiling) {
+            malloc_tree * new_tree = new malloc_tree;
+            profiling_tree.insert(std::pair<unsigned, malloc_tree *>(malloc_cnt, new_tree));
+        }
         malloc_cnt++;
 
         // data mapping
@@ -3689,6 +4063,7 @@ public:
 
     // simply interleave pages across chiplet in a round-robin manner
     void allocate_base_rr(uint64_t base_vpn, uint64_t num_pages) {
+        assert(!m_config->enable_mem_reserved && "Not supported yet");
         unsigned chiplet_id = 0;
         uint64_t page_mode  = (uint64_t)m_config->set_page_size;
 
@@ -3709,6 +4084,7 @@ public:
     }
 
     void allocate_kernel_wide(uint64_t base_vpn, uint64_t num_pages){
+        assert(!m_config->enable_mem_reserved && "Not supported yet");
         unsigned chiplet_id = 0;
         uint64_t page_mode  = (uint64_t)m_config->set_page_size;
         unsigned tot_chiplet_num = m_config->chiplet_num;
@@ -3762,6 +4138,7 @@ public:
     }
 
     void allocate_advanced_kernel_wide(uint64_t base_vpn, uint64_t num_pages, uint64_t law_byte){
+        assert(!m_config->enable_mem_reserved && "Not supported yet");
         unsigned chiplet_id = 0;
         unsigned tot_chiplet_num = m_config->chiplet_num;
         uint64_t byte_per_chip = law_byte / tot_chiplet_num;
@@ -3825,6 +4202,7 @@ public:
     }
 
     void allocate_stride_based(uint64_t base_vpn, uint64_t num_pages, unsigned stride) {
+        assert(!m_config->enable_mem_reserved && "Not supported yet");
         assert(stride != 0);
         unsigned chiplet_id = 0;
         uint64_t page_mode  = (uint64_t)m_config->set_page_size;
@@ -3867,6 +4245,7 @@ public:
     }
 
     void allocate_column_based(uint64_t base_vpn, uint64_t num_pages, unsigned row_width) {
+        assert(!m_config->enable_mem_reserved && "Not supported yet");
         assert(row_width != 0);
         uint64_t page_mode  = (uint64_t)m_config->set_page_size;
         unsigned tot_chiplet_num = m_config->chiplet_num;
@@ -3915,6 +4294,103 @@ public:
                 break;
         }
         assert(tot_alloc_count == num_pages);
+    }
+
+    void update_profiling(uint64_t vpn, unsigned chiplet) {
+        unsigned malloc_num = get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
+        unsigned malloc_decision = get_malloc_decision(malloc_num);
+        if (malloc_num == -1 || malloc_decision != 0) {
+            return;
+        }
+
+        uint64_t va_block_vpn = vpn >> static_cast<uint64_t>(PAGE_2M_SHIFT);
+        unsigned offset = static_cast<unsigned>(vpn % (va_block_vpn << static_cast<uint64_t>(PAGE_2M_SHIFT)));
+        unsigned page_index = offset / static_cast<unsigned>(PAGE_64K);
+        assert(offset % static_cast<unsigned>(PAGE_64K) == 0);
+
+        malloc_tree * get_malloc_tree = profiling_tree.at(malloc_num);
+        auto find = get_malloc_tree->find(va_block_vpn);
+        if (find == get_malloc_tree->end()) {
+            int num_leaf = static_cast<int>(PAGE_2M) / static_cast<int>(PAGE_64K);
+            int tot_node =  (num_leaf * 2) - 1;
+            va_block_tree * new_block_tree = new va_block_tree(tot_node, m_config->chiplet_num);
+            get_malloc_tree->insert(std::pair<uint64_t, va_block_tree *>(va_block_vpn, new_block_tree));
+        }
+        va_block_tree * get_block_tree = get_malloc_tree->at(va_block_vpn);
+        get_block_tree->update_leaf_page(page_index, chiplet);
+
+        // trigger decision
+        uint64_t total_malloc_size = get_malloc_num_pages(malloc_num) / static_cast<uint64_t>(PAGE_2M);
+        uint64_t malloc_mapped_size = static_cast<uint64_t>(get_malloc_tree->size());
+        float mapped_ratio = static_cast<float>(malloc_mapped_size) / static_cast<float>(total_malloc_size);
+        if (mapped_ratio > m_config->mapping_threshold) {
+            page_size_selection(malloc_num);
+        }
+    }
+
+    void page_size_selection(unsigned malloc_num) {
+        malloc_tree * get_malloc_tree = profiling_tree.at(malloc_num);
+        std::map<unsigned, unsigned> page_size_cnt;
+        page_size_cnt.clear();
+
+        // Can use page-walk based ratio, but there is no significant different
+        float remote_ratio = hub->get_malloc_remote_ratio(malloc_num);
+
+        for (auto iter = get_malloc_tree->begin(); iter != get_malloc_tree->end(); ++iter) {
+            va_block_tree* get_block_tree = iter->second;
+            if (get_block_tree->m_block_tree[0].m_chiplet_score == 0.0f) {
+                continue;  // not fully mapped block
+            }
+
+            bool exit = false;
+            unsigned probe_index = 0;
+            unsigned probe_cnt = 1;
+            unsigned probe_size = 0;
+            while (!exit) {
+                float accum_score = 0.0f;
+                for (unsigned i = probe_index; i < probe_index + probe_cnt; i++) {
+                    accum_score += get_block_tree->m_block_tree[i].m_chiplet_score;
+                }
+                float avg_score = accum_score / static_cast<float>(probe_cnt);
+                if (avg_score >= (m_config->selection_threshold - remote_ratio)) {
+                    probe_size = probe_cnt;
+                    exit = true;
+                } else {
+                    probe_index += probe_cnt;
+                    probe_cnt *= 2;
+                    if (probe_index >= get_block_tree->m_block_tree.size()) {
+                        exit = true;
+                    }
+                }
+            }
+
+            if (probe_size != 0) {
+                unsigned selected_size = static_cast<unsigned>(PAGE_2M) / probe_size;
+                if (page_size_cnt.find(selected_size) == page_size_cnt.end()){
+                    page_size_cnt.insert(std::pair<unsigned, unsigned>(selected_size, 0));
+                }
+                page_size_cnt[selected_size]++;
+            }
+        }
+
+        unsigned most_frequent_size = 0;
+        unsigned frequent_cnt = 0;
+        for (auto iter = page_size_cnt.begin(); iter != page_size_cnt.end(); ++iter) {
+            unsigned get_cnt = iter->second;
+            if (get_cnt >= frequent_cnt) {
+                most_frequent_size = iter->first;
+                frequent_cnt = get_cnt;
+            }
+        }
+
+        if (most_frequent_size == 0) {  // profiling fail
+            malloc_page_decision_done.insert(std::pair<unsigned, unsigned>(malloc_num, 1));
+        } else {
+            malloc_page_decision_done.insert(std::pair<unsigned, unsigned>(malloc_num, most_frequent_size));
+        }
+
+        // jun_debug: remove it later
+        //fprintf(stderr, "Malloc %d Selected %d\n", malloc_num, most_frequent_size);
     }
 
     void free(void* a) {
@@ -3975,7 +4451,7 @@ void* Hub::translate(uint64_t old_ID, void* vaddr, unsigned chiplet) {
 
     unsigned page_mode = m_mem_config->set_page_size;
     if (m_mem_config->mcm_data_schedule == PAGE_FIRST_TOUCH) {
-        unsigned malloc_num = get_malloc(vpn << 12);
+        unsigned malloc_num = get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
         alloc_chiplet = pmm->get_alloc_chiplet(malloc_num, chiplet);
     }
 
@@ -3984,12 +4460,34 @@ void* Hub::translate(uint64_t old_ID, void* vaddr, unsigned chiplet) {
     if (phys_page_addr == max_uint64) {
         tlb_tag_array * shared_tlb = m_mmu->get_L2_tlb();
         unsigned page_mode = m_mem_config->set_page_size;
-        shared_tlb->record_page_size(vpn, alloc_chiplet, page_mode);
-        mapping_pages(vpn, page_mode, alloc_chiplet);
+        if (m_mem_config->enable_profiling) {
+            shared_tlb->record_page_size(vpn, alloc_chiplet, m_mem_config->mapping_granularity);
+            mapping_pages_profiling(vpn, page_mode, alloc_chiplet);
+        } else if (m_mem_config->enable_mem_reserved) {
+            shared_tlb->record_page_size(vpn, alloc_chiplet, m_mem_config->mapping_granularity);
+            mapping_pages_reservation(vpn, page_mode, alloc_chiplet, true);
+        } else {
+            shared_tlb->record_page_size(vpn, alloc_chiplet, page_mode);
+            mapping_pages(vpn, page_mode, alloc_chiplet);
+        }
     }
     phys_page_addr = pmm->translate(ID, vpn);
     assert(phys_page_addr != max_uint64 && "failed to register virtual address");
     return (void*)(phys_page_addr + static_cast<uint64_t>(fixed_vaddr) % page_size);
+}
+
+void* Hub::translate(void* vaddr) {
+    uint64_t ID = APP_ID;
+    const uint64_t mask = (max_uint64 >> 16);  // 48-bit parsing mask
+    const uint64_t fixed_vaddr = reinterpret_cast<uint64_t>(vaddr) & mask;  // 48-bit parsing mask
+    const uint64_t vpn = static_cast<uint64_t>(fixed_vaddr) / page_size;
+
+    uint64_t phys_page_addr = pmm->translate(ID, vpn);
+    if (phys_page_addr == max_uint64) {
+        return (void*)(max_uint64);
+    } else {
+        return (void*)(phys_page_addr + static_cast<uint64_t>(fixed_vaddr) % page_size);
+    }
 }
 
 void Hub::mapping_pages(uint64_t vpn, unsigned int page_size, unsigned int chiplet) {
@@ -4001,10 +4499,56 @@ void Hub::mapping_pages(uint64_t vpn, unsigned int page_size, unsigned int chipl
     } else {
         pmm->allocate(ID, base_vpn, page_size, chiplet, page_size);
     }
-    for (uint64_t i = 0; i < static_cast<uint64_t>(page_size); i++){
-        uint64_t alloc_vpn = base_vpn + i;
-        if (page_size > static_cast<uint64_t>(PAGE_2M)) {
-            assert(0 && "Not supported yet!");
+}
+
+void Hub::mapping_pages_reservation(uint64_t vpn, unsigned int page_size, unsigned int chiplet, bool decision) {
+    uint64_t ID = APP_ID;
+    assert(m_mem_config->mapping_granularity == PAGE_64K);
+    new_addr_type offset_shift = (new_addr_type)(std::log2(static_cast<float>(m_mem_config->mapping_granularity)));
+    new_addr_type base_vpn = (new_addr_type)(static_cast<new_addr_type>(vpn >> offset_shift) << offset_shift);
+
+    new_addr_type offset_shift_block = (new_addr_type)(std::log2(static_cast<float>(page_size)));
+    new_addr_type block_vpn = (new_addr_type)(static_cast<new_addr_type>(vpn >> offset_shift_block) << offset_shift_block);
+    if (page_size > static_cast<uint64_t>(PAGE_2M)) {
+        assert(0 && "Not supported yet!");
+    } else {
+        bool promotion_flag = false;
+        pmm->allocate_reserved(ID, base_vpn, m_mem_config->mapping_granularity, block_vpn, chiplet,
+          page_size, promotion_flag, decision);
+        if (promotion_flag) {
+            assert(page_size == PAGE_2M);  // page size promotion only for 2MB pages
+            m_mmu->get_L2_tlb()->update_page_size(vpn, chiplet, page_size);
+        }
+    }
+}
+
+void Hub::mapping_pages_profiling(uint64_t vpn, unsigned int page_size, unsigned int chiplet) {
+    uint64_t ID = APP_ID;
+    assert(m_mem_config->mapping_granularity == PAGE_64K);
+    unsigned malloc_num = get_malloc(vpn << static_cast<uint64_t>(PAGE_OFFSET));
+    unsigned malloc_decision = get_malloc_decision(malloc_num);
+    unsigned block_status = get_block_status(vpn >> static_cast<uint64_t>(PAGE_2M_SHIFT));
+
+    if (malloc_decision != 0 && malloc_decision != 1 && (block_status == UNMAPPED || block_status == MAPPED_AFTER_DECISION)) {
+        return mapping_pages_reservation(vpn, malloc_decision, chiplet, true);
+    } else if (block_status == MAPPED_BROKEN) {
+        return mapping_pages_reservation(vpn, m_mem_config->mapping_granularity, chiplet, false);
+    }
+
+    // Opportunistic large paging
+    new_addr_type offset_shift = (new_addr_type)(std::log2(static_cast<float>(m_mem_config->mapping_granularity)));
+    new_addr_type base_vpn = (new_addr_type)(static_cast<new_addr_type>(vpn >> offset_shift) << offset_shift);
+
+    new_addr_type offset_shift_block = (new_addr_type)(std::log2(static_cast<float>(page_size)));
+    new_addr_type block_vpn = (new_addr_type)(static_cast<new_addr_type>(vpn >> offset_shift_block) << offset_shift_block);
+    if (page_size > static_cast<uint64_t>(PAGE_2M)) {
+        assert(0 && "Not supported yet!");
+    } else {
+        bool promotion_flag = false;
+        pmm->allocate_profiling(ID, base_vpn, m_mem_config->mapping_granularity, block_vpn, chiplet, page_size, promotion_flag);
+        if (promotion_flag) {
+            assert(page_size == PAGE_2M);  // page size promotion only for 2MB pages
+            m_mmu->get_L2_tlb()->update_page_size(vpn, chiplet, page_size);
         }
     }
 }
@@ -4037,6 +4581,20 @@ unsigned Hub::get_malloc(uint64_t base_addr) {
 unsigned Hub::get_tot_malloc_num() {
     uint64_t ID = APP_ID;
     return vmms[ID]->get_tot_malloc_num();
+}
+
+unsigned Hub::get_malloc_decision(unsigned malloc_num) {
+    uint64_t ID = APP_ID;
+    return vmms[ID]->get_malloc_decision(malloc_num);
+}
+
+unsigned Hub::get_block_status(uint64_t block_vpn) const {
+     return pmm->get_block_status(block_vpn);
+}
+
+void Hub::update_profiling(uint64_t vpn, unsigned chiplet) {
+    uint64_t ID = APP_ID;
+    vmms[ID]->update_profiling(vpn, chiplet);
 }
 
 float Hub::get_malloc_remote_ratio(unsigned malloc_num) {

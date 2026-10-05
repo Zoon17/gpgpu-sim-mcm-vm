@@ -10,6 +10,8 @@
 // Licensed under the BSD 3-Clause License.
 // See the COPYRIGHT file in the project root for full license text.
 
+#include "tlb.h"
+
 #include "stat-tool.h"
 #include <cassert>
 #include "tlb.h"
@@ -44,8 +46,9 @@ tlb_tag_array::tlb_tag_array(const memory_config *config,
 
     m_isL2TLB = false;
 
-    // Aan unified tlb that handles multiple page sizes
+    // Unified tlb that handles multiple page sizes
     tag_array = new std::list<tlb_entry>;
+    coal_tag_array = new std::list<coal_entry>;
 
     root = page_manager->get_page_table_root();
 
@@ -65,6 +68,7 @@ tlb_tag_array::tlb_tag_array(const memory_config *config,
     chiplet_request_queue = nullptr;
     m_memory_partition    = nullptr;
     l2_tag_array          = nullptr;
+    coal_l2_tag_array     = nullptr;
     page_walk_subsystem   = nullptr;
     m_ways                = 0;
     m_entries             = 0;
@@ -107,13 +111,19 @@ tlb_tag_array::tlb_tag_array(const memory_config *config,
     }
     m_page_mode = m_config->set_page_size;
 
+    if (m_config->enable_profiling) {
+        assert(m_config->vm_config == VM_BASELINE);
+    }
+
     // init unused member variables
     tag_array           = nullptr;
+    coal_tag_array      = nullptr;
     tlb_return_queue    = nullptr;
     root                = nullptr;
     m_mother_tlb        = nullptr;
     m_shared_tlb        = nullptr;
     l2_tag_array        = nullptr;
+    coal_l2_tag_array   = nullptr;
     page_walk_subsystem = nullptr;
     m_core_id           = 0;
     m_ways              = 0;
@@ -146,6 +156,11 @@ tlb_tag_array::tlb_tag_array(const memory_config *config, shader_core_stats *sta
         l2_tag_array[i] = new std::list<tlb_entry>;
     }
 
+    coal_l2_tag_array = new std::list<coal_entry> * [m_entries];
+    for (unsigned i = 0; i < m_entries; i++){
+        coal_l2_tag_array[i] = new std::list<coal_entry>;
+    }
+
     page_walk_subsystem =
         new PageWalkSubsystem(this, page_manager, config, mem_stat);
     stall = false;
@@ -157,6 +172,7 @@ tlb_tag_array::tlb_tag_array(const memory_config *config, shader_core_stats *sta
 
     // init unused member variables
     tag_array             = nullptr;
+    coal_tag_array        = nullptr;
     tlb_return_queue      = nullptr;
     root                  = nullptr;
     chiplet_request_queue = nullptr;
@@ -172,7 +188,6 @@ new_addr_type tlb_tag_array::get_tlbreq_addr(mem_fetch *mf) {
     return return_addr;
 }
 
-// Right now multi-page-size fill only support baseline and MASK
 // Only for L1 TLB
 void tlb_tag_array::fill(new_addr_type addr, mem_fetch *mf) {
     /* Does not have to fill if we always return TLB HIT(speeding things up)*/
@@ -197,6 +212,40 @@ void tlb_tag_array::fill(new_addr_type addr, mem_fetch *mf) {
     active_tag_array->emplace_front(key_shift, page_shift, page_size);
 }
 
+void tlb_tag_array::fill(new_addr_type addr, new_addr_type coal_offset,
+        std::bitset<COALESCING> coal_bitset,mem_fetch *mf) {
+    new_addr_type key = get_key(addr, mf->get_appID());
+    m_mshrs.mark_ready(key, this);
+
+    unsigned page_size = mf->get_page_size();
+    assert(page_size != 0);
+
+    new_addr_type page_shift = (new_addr_type)(std::log2(static_cast<float>(page_size)));
+    new_addr_type key_shift = (new_addr_type)(key >> page_shift);
+
+    std::list<coal_entry> *active_tag_array = coal_tag_array;
+    if (page_size == PAGE_2M) {
+        if (active_tag_array->size() >= m_config->tlb_size) {
+            active_tag_array->pop_back();  // LRU
+        }
+        active_tag_array->emplace_front(key_shift, page_shift, page_size);
+    } else {
+        assert(page_size == PAGE_64K);
+        new_addr_type coal_tag = key_shift >> static_cast<new_addr_type>(COALESCING_SHIFT);
+
+        for (auto iter = active_tag_array->begin(); iter != active_tag_array->end(); ++iter) {
+            if (iter->m_page_size == page_size && iter->m_tag == coal_tag &&
+                iter->m_vir_phy_offset == coal_offset) {
+                active_tag_array->erase(iter);
+                break;
+            }
+        }
+        if (active_tag_array->size() >= m_config->tlb_size) {
+            active_tag_array->pop_back();  // LRU
+        }
+        active_tag_array->emplace_front(coal_tag, page_shift, page_size, coal_offset, coal_bitset);
+    }
+}
 
 void tlb_tag_array::set_l1_tlb(int coreID, tlb_tag_array *l1) {
     l1_tlb[coreID] = l1;
@@ -214,7 +263,11 @@ void tlb_tag_array::set_l1_tlb(int coreID, tlb_tag_array *l1, unsigned int chipl
 // fill into the per-chiplet L2 TLB
 void tlb_tag_array::l2_fill(new_addr_type addr,
                             unsigned accessor, mem_fetch *mf) {
-    m_shared_tlb->chiplet_l2_tlb[mf->get_tlb_chiplet()]->fill(addr, accessor, mf);
+    if (m_config->enable_profiling) {
+        m_shared_tlb->chiplet_l2_tlb[mf->get_tlb_chiplet()]->fill_coalescing(addr, accessor, mf);
+    } else {
+        m_shared_tlb->chiplet_l2_tlb[mf->get_tlb_chiplet()]->fill(addr, accessor, mf);
+    }
 }
 
 // L2 TLB fill
@@ -244,9 +297,59 @@ void tlb_tag_array::fill(new_addr_type addr, unsigned accessor,
     correct_tag_array[index]->emplace_front(key_shift, page_shift, page_size);
 }
 
+void tlb_tag_array::fill_coalescing(new_addr_type addr, unsigned accessor,
+                         mem_fetch *mf)
+{
+    assert(accessor == 1);
+    new_addr_type key = get_key(addr, mf->get_appID());
+    m_mshrs.mark_ready(key);
+
+    unsigned page_size = mf->get_page_size();
+    assert(page_size != 0);
+
+    new_addr_type page_shift = (new_addr_type)(std::log2(static_cast<float>(page_size)));
+    new_addr_type key_shift = (new_addr_type)(key >> page_shift);
+
+    // index check, hashed_index for unified tlb
+    unsigned index = get_tlb_index(key);
+
+    std::list<coal_entry> **correct_tag_array = coal_l2_tag_array;
+    if (page_size == PAGE_2M) {
+        if (correct_tag_array[index]->size() >= (m_ways)) {
+            correct_tag_array[index]->pop_back();  // LRU
+        }
+        fill_into_l1_tlb(addr, 0, 0, mf);
+        correct_tag_array[index]->emplace_front(key_shift, page_shift, page_size);
+    } else {
+        assert(page_size == PAGE_64K);
+        std::bitset<COALESCING> coal_bitset;
+        coal_bitset.reset();
+
+        new_addr_type coal_offset = probe_contiguity(key_shift, coal_bitset);
+        new_addr_type coal_tag = key_shift >> static_cast<new_addr_type>(COALESCING_SHIFT);
+
+        for (auto iter = correct_tag_array[index]->begin(); iter != correct_tag_array[index]->end(); ++iter) {
+            if (iter->m_page_size == page_size && iter->m_tag == coal_tag &&
+                iter->m_vir_phy_offset == coal_offset) {
+                correct_tag_array[index]->erase(iter);
+                break;
+            }
+        }
+        if (correct_tag_array[index]->size() >= (m_ways)) {
+            correct_tag_array[index]->pop_back();  // LRU
+        }
+        fill_into_l1_tlb(addr, coal_offset, coal_bitset, mf);
+        correct_tag_array[index]->emplace_front(coal_tag, page_shift, page_size, coal_offset, coal_bitset);
+    }
+}
+
 // TLB lookup function for L1 TLBs
 enum tlb_request_status tlb_tag_array::probe(
         new_addr_type addr, unsigned accessor, mem_fetch *mf) {
+    if (m_config->enable_profiling) {
+        return probe_coalescing(addr, accessor, mf);
+    }
+
     if (m_config->enable_remote_debug && mf->get_malloc_num() == static_cast<unsigned>(-1)) {
         mf->set_malloc_num(m_gpu_alloc->get_malloc(mf->get_original_addr()));
     }
@@ -318,7 +421,91 @@ enum tlb_request_status tlb_tag_array::probe(
     }
 }
 
+enum tlb_request_status tlb_tag_array::probe_coalescing(
+        new_addr_type addr, unsigned accessor, mem_fetch *mf) {
+    if (m_config->enable_remote_debug && mf->get_malloc_num() == static_cast<unsigned>(-1)) {
+        mf->set_malloc_num(m_gpu_alloc->get_malloc(mf->get_original_addr()));
+    }
+
+    m_mem_stats->l1_tlb_tot_access++;
+    new_addr_type key = get_key(addr, mf->get_appID());
+
+    for (auto iter = coal_tag_array->begin(); iter != coal_tag_array->end(); ++iter){
+        new_addr_type key_shift = iter->m_shift;
+        new_addr_type probe_key = key >> key_shift;
+        if (iter->m_page_size == PAGE_2M) {
+            if (probe_key == iter->m_tag) {
+                unsigned page_size = iter->m_page_size;
+                coal_tag_array->splice(coal_tag_array->begin(), *coal_tag_array, iter);  // LRU update
+                m_mem_stats->l1_tlb_tot_hit++;
+                m_mem_stats->l1_hit_per_size[page_size]++;
+                unsigned bank_id = mf->get_bank_id();
+                assert(bank_id != static_cast<unsigned>(-1));
+                mf->set_tlb_ready_cycle(m_config->l1_tlb_latency);
+                if (!tlb_return_queue[bank_id]->empty()){
+                    mem_fetch * mf_back = tlb_return_queue[bank_id]->back();
+                    assert(mf->get_tlb_ready_cycle() >= mf_back->get_tlb_ready_cycle());
+                }
+                tlb_return_queue[bank_id]->push_back(mf);
+                return TLB_HIT_PROCESS;
+            }
+        } else {
+            assert(iter->m_page_size == PAGE_64K);
+            new_addr_type coal_key = probe_key >> static_cast<new_addr_type>(COALESCING_SHIFT);
+            new_addr_type offset = probe_key & static_cast<new_addr_type>(COALESCING - 1);
+            if (coal_key == iter->m_tag && iter->m_valid_bitset.test(offset)) {
+                unsigned page_size = iter->m_page_size;
+                coal_tag_array->splice(coal_tag_array->begin(), *coal_tag_array, iter);  // LRU update
+                m_mem_stats->l1_tlb_tot_hit++;
+                m_mem_stats->l1_hit_per_size[page_size * static_cast<unsigned>(iter->m_valid_bitset.count())]++;
+                unsigned bank_id = mf->get_bank_id();
+                assert(bank_id != static_cast<unsigned>(-1));
+                mf->set_tlb_ready_cycle(m_config->l1_tlb_latency);
+                if (!tlb_return_queue[bank_id]->empty()){
+                    mem_fetch * mf_back = tlb_return_queue[bank_id]->back();
+                    assert(mf->get_tlb_ready_cycle() >= mf_back->get_tlb_ready_cycle());
+                }
+                tlb_return_queue[bank_id]->push_back(mf);
+                return TLB_HIT_PROCESS;
+            }
+        }
+    }
+
+    bool mshr_hit = m_mshrs.probe(key);
+    bool mshr_avail = !m_mshrs.full(key);
+    if (mshr_hit && mshr_avail) {
+        m_mshrs.add(key, mf);
+        m_mem_stats->l1_tlb_tot_hit_reserved++;
+        return TLB_MISS;
+    } else if (mshr_hit && !mshr_avail) {  // mhsr merge fail
+        m_mem_stats->l1_tlb_tot_fail++;
+        m_mem_stats->l1_tlb_mshr_merge_fail++;
+        return TLB_MSHR_FAIL;
+    }
+
+    assert(!mshr_hit);
+
+    if (!mshr_hit && mshr_avail) {
+        if (request_shared_tlb(addr, accessor, mf)) {  // send request to L2 tlb
+            m_mshrs.add(key, mf);
+            m_mem_stats->l1_tlb_tot_miss++;
+            return TLB_MISS;
+        } else {
+            m_mem_stats->l1_tlb_tot_fail++;
+            m_mem_stats->l1_tlb_mshr_l2_stall++;
+            return TLB_MSHR_FAIL;
+        }
+    } else {  // mshr allocate fail
+        m_mem_stats->l1_tlb_tot_fail++;
+        m_mem_stats->l1_tlb_mshr_allocate_fail++;
+        return TLB_MSHR_FAIL;
+    }
+}
+
 enum tlb_request_status tlb_tag_array::probe(new_addr_type addr, mem_fetch *mf, unsigned int chiplet) {
+    if (m_config->enable_profiling) {
+        return chiplet_l2_tlb[chiplet]->probe_coalescing(addr, mf);  // pass to per-chiplet L2 TLB
+    }
     return chiplet_l2_tlb[chiplet]->probe(addr, mf);  // pass to per-chiplet L2 TLB
 }
 
@@ -394,6 +581,89 @@ enum tlb_request_status tlb_tag_array::probe(new_addr_type addr, mem_fetch *mf) 
     }
 }
 
+//per-chiplet L2 TLB probe
+enum tlb_request_status tlb_tag_array::probe_coalescing(new_addr_type addr, mem_fetch *mf) {
+    assert(m_shared_tlb == nullptr);
+    new_addr_type key = get_key(addr, mf->get_appID());
+
+    m_mem_stats->l2_tlb_tot_accesses++;
+    unsigned index = get_tlb_index(key);
+    std::list<coal_entry> * probe_array = coal_l2_tag_array[index];
+    for (auto iter = probe_array->begin(); iter != probe_array->end(); ++iter){
+        new_addr_type key_shift = iter->m_shift;
+        new_addr_type probe_key = (new_addr_type)(key >> key_shift);
+        if (iter->m_page_size == PAGE_2M) {
+            if (probe_key == iter->m_tag) {
+                /* Fill into L1 TLB */
+                unsigned page_size = iter->m_page_size;
+                mf->set_page_size(page_size);
+                tlb_tag_array *l1_tlb = mf->get_tlb();
+                l1_tlb->fill(mf->get_addr(), 0, 0, mf);
+
+                probe_array->splice(probe_array->begin(), *probe_array, iter);  // LRU update
+                m_mem_stats->l2_tlb_tot_hits++;
+                m_mem_stats->l2_hit_per_size[page_size]++;
+                return TLB_HIT;
+            }
+        } else {
+            assert(iter->m_page_size == PAGE_64K);
+            new_addr_type coal_key = probe_key >> static_cast<new_addr_type>(COALESCING_SHIFT);
+            new_addr_type offset = probe_key & static_cast<new_addr_type>(COALESCING - 1);
+            if (coal_key == iter->m_tag && iter->m_valid_bitset.test(offset)) {
+                /* Fill into L1 TLB */
+                unsigned page_size = iter->m_page_size;
+                mf->set_page_size(page_size);
+                tlb_tag_array *l1_tlb = mf->get_tlb();
+                l1_tlb->fill(mf->get_addr(), iter->m_vir_phy_offset, iter->m_valid_bitset, mf);
+
+                m_mem_stats->l2_tlb_tot_hits++;
+                m_mem_stats->l2_hit_per_size[page_size * static_cast<unsigned>(iter->m_valid_bitset.count())]++;
+                probe_array->splice(probe_array->begin(), *probe_array, iter);  // LRU update
+                return TLB_HIT;
+            }
+        }
+    }
+
+    bool mshr_hit = m_mshrs.probe(key);
+    bool mshr_avail = !m_mshrs.full(key);
+    if (mshr_hit && mshr_avail) {
+        m_mshrs.add(key, mf);
+        m_mem_stats->l2_tlb_tot_mshr_hits++;
+        return TLB_HIT_RESERVED;
+    }
+
+    if (!mshr_hit && mshr_avail) {
+        if (m_config->enable_walk_fault) {
+            if (!m_gpu_alloc->check_mapping(key)) {
+                mf->trigger_fault();
+            }
+        }
+
+        mf->set_page_size(m_mother_tlb->get_page_size(m_mother_tlb->get_key(mf->get_addr(), mf->get_appID())));
+        mf->set_page_addr();
+
+        if (page_walk_subsystem->enqueue(mf))   // page walk start or page walk enqueue
+        {
+            m_mshrs.add(key, mf);
+            m_mem_stats->l2_tlb_tot_misses++;
+            return TLB_MISS;
+        } else {
+            m_mem_stats->l2_tlb_mshr_pwq_full++;
+            return TLB_BACKPRESSURE_MISS;
+        }
+    } else {
+        m_mem_stats->l2_tlb_tot_mshr_fails++;
+        // stat collect
+        if (mshr_hit && !mshr_avail) {
+            m_mem_stats->l2_tlb_mshr_merge_fail++;
+        }
+        if (!mshr_hit && !mshr_avail) {
+            m_mem_stats->l2_tlb_mshr_allocate_fail++;
+        }
+        return TLB_MSHR_FAIL;
+    }
+}
+
 bool tlb_tag_array::request_shared_tlb(new_addr_type addr,
                                        unsigned accessor, mem_fetch *mf) {
 
@@ -420,6 +690,15 @@ void tlb_tag_array::fill_into_l1_tlb(new_addr_type addr, mem_fetch *mf) {
         mem_fetch *mshr_f = m_mshrs.next_access();
         tlb_tag_array *l1_t = mshr_f->get_tlb();
         l1_t->fill(addr, mshr_f);
+    }
+}
+
+void tlb_tag_array::fill_into_l1_tlb(new_addr_type addr, new_addr_type coal_offset,
+    std::bitset<COALESCING> coal_bitset, mem_fetch *mf) {
+    while (m_mshrs.access_ready()) {
+        mem_fetch *mshr_f = m_mshrs.next_access();
+        tlb_tag_array *l1_t = mshr_f->get_tlb();
+        l1_t->fill(addr, coal_offset, coal_bitset, mshr_f);
     }
 }
 
@@ -497,13 +776,20 @@ unsigned tlb_tag_array::record_page_size(new_addr_type key, unsigned chiplet, un
     }
 }
 
+void tlb_tag_array::update_page_size(new_addr_type key, unsigned chiplet, unsigned page_mode) {
+    new_addr_type key_chunk = key >> 9;  // shift hard coded
+    auto find_chunk = page_mode_map.find(key_chunk);
+    assert(find_chunk != page_mode_map.end());
+    page_mode_map[key_chunk] = page_mode;
+}
+
 unsigned tlb_tag_array::get_page_size(new_addr_type key) {
     new_addr_type key_chunk = key >> 9;  // shift hard coded
     auto find_chunk = page_mode_map.find(key_chunk);
     if (find_chunk != page_mode_map.end()){
         return page_mode_map.at(key_chunk);
     } else {
-        assert(0 && "should not have reached here\n");
+        return 0;
     }
 }
 
@@ -603,6 +889,32 @@ void tlb_tag_array::done_tlb_req(mem_fetch * mf) {
     } else {  /* If the memory fetch is done */
         pageWalker->page_walk_return(mf);
     }
+}
+
+new_addr_type tlb_tag_array::probe_contiguity(new_addr_type key, std::bitset<COALESCING> &coal_bitset) {
+    new_addr_type coal_key = key >> static_cast<new_addr_type>(COALESCING_SHIFT);
+    new_addr_type base_key = coal_key << static_cast<new_addr_type>(COALESCING_SHIFT);
+
+    assert(m_config->mapping_granularity == PAGE_64K);
+    new_addr_type vir_addr = key << static_cast<new_addr_type>(PAGE_64K_SHIFT + PAGE_OFFSET);  // shift hard coded
+    new_addr_type phy_addr = (new_addr_type)m_gpu_alloc->translate(reinterpret_cast<void *>(vir_addr));
+    assert(phy_addr != static_cast<new_addr_type>(max_uint64));
+    new_addr_type offset = vir_addr - phy_addr;
+
+    for (new_addr_type i = 0; i < static_cast<new_addr_type>(COALESCING); i++) {
+        new_addr_type probe_key = base_key + i;
+        new_addr_type probe_vir = probe_key << static_cast<new_addr_type>(PAGE_64K_SHIFT + PAGE_OFFSET);  // shift hard coded
+        new_addr_type probe_phy = (new_addr_type)m_gpu_alloc->translate(reinterpret_cast<void *>(probe_vir));
+        if (probe_key == static_cast<new_addr_type>(max_uint64)) {
+            continue;
+        }
+        new_addr_type probe_offset = probe_vir - probe_phy;
+        if (offset == probe_offset) {
+            coal_bitset.set(i, true);
+        }
+    }
+    assert(coal_bitset.count() >= 1);
+    return offset;
 }
 
 // TLB shootdown

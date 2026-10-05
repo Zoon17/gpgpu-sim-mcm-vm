@@ -532,6 +532,13 @@ class memory_config {
   unsigned mem_config;
   bool enable_mem_side;
   bool enable_remote_debug;
+
+  bool enable_mem_reserved;
+  unsigned mapping_granularity;
+
+  bool enable_profiling;
+  float mapping_threshold;
+  float selection_threshold;
   /****************************************************************************/
 
   unsigned dram_bnk_indexing_policy;

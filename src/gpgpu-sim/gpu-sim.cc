@@ -443,6 +443,18 @@ void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-enable_remote_debug", OPT_BOOL, &enable_remote_debug,
                          "Enable remote memory access debug", "0");
 
+  option_parser_register(opp, "-enable_mem_reserved", OPT_BOOL, &enable_mem_reserved,
+                       "Enable reservation-based memory mapping", "0");
+option_parser_register(opp, "-mapping_granularity", OPT_UINT32, &mapping_granularity,
+                       "Memory mapping granularity under reservation-based scheme", "16");
+
+  option_parser_register(opp, "-enable_profiling", OPT_BOOL, &enable_profiling,
+                       "Enable mapping profiling (CLAP)", "0");
+  option_parser_register(opp, "-mapping_threshold", OPT_FLOAT, &mapping_threshold,
+                       "Threshold for triggering page size selection", "0.30");
+  option_parser_register(opp, "-selection_threshold", OPT_FLOAT, &selection_threshold,
+                       "Threshold to select proper page size", "1");
+
 
   /********************************************************************************************************************/
   m_address_mapping.addrdec_setoption(opp);
